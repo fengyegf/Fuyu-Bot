@@ -12,9 +12,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use fuyubot_abi::{
-    ABI_VERSION, EventCallbackFn, FILTER_EVENT_TYPE_KEY, HostApiVTable, MiddlewareCallbackFn,
-    MiddlewareHandle, RequestId, ServiceHandle, ServiceMethod, ServiceVTable, SubscriptionHandle,
-    ToolHandle, WaitHandle,
+    ABI_VERSION, EventCallbackFn, FILTER_EVENT_TYPE_KEY, HostApi, HostApiVTable,
+    MiddlewareCallbackFn, MiddlewareHandle, RequestId, SIMPLIFY_OP_KEY, ServiceHandle,
+    ServiceMethod, ServiceVTable, SubscriptionHandle, ToolHandle, WaitHandle,
 };
 use fuyubot_core::{Context, Effect, PluginManager, PluginReporter, Report};
 use fuyubot_event::{EventBus, Filter, SubscriptionHandle as EventSubscription};
@@ -23,6 +23,7 @@ use fuyubot_middleware::{
     Stage as MwStage,
 };
 use fuyubot_service::{ServiceContextExt as _, ServiceHandle as SvcRegistration};
+use fuyubot_simplify::{Simplify, ops};
 use fuyubot_tdlib::{TdClient, schema::TdApiSchema};
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolHandlerFn, ToolRegistry};
 use serde_json::{Value, json};
@@ -62,6 +63,19 @@ const REQUEST_LOG_CAPACITY: usize = 256;
 
 /// 没接 TDLib 时用的合成请求号起点：躲开 TDLib `@extra` 的低位区间。
 const SYNTHETIC_REQUEST_BASE: u64 = 1 << 48;
+
+/// `simplify_invoke` 的操作号起点：再高一档，与 TDLib / 合成请求号都不重叠。
+///
+/// 它**不是**发给 TDLib 的请求号，只是「这次操作的回投地址」——
+/// 结果走 [`RESPONSE_EVENT`] 回到发起插件，靠的就是这个号。
+const SIMPLIFY_REQUEST_BASE: u64 = 1 << 49;
+
+/// 同时跑着的 simplify 工作线程超过这个数就打一条警告。
+///
+/// 目前是**一个操作一个线程**（op 内部是阻塞的：等响应、等发送结局都要卡住）。
+/// 不做硬上限是因为上限满了只能拒绝，而「消息没发出去」比「线程多一点」糟得多；
+/// 真要把并发收住，正确做法是改成有界的等待器池，不是在这里砍请求。
+const SIMPLIFY_BUSY_WORKERS: usize = 64;
 
 /// 请求归属表（请求号 → 发起它的插件）的容量上限。
 ///
@@ -235,6 +249,10 @@ pub struct HostRuntime {
     request_owners: Mutex<RequestOwners>,
     /// 没接 TDLib 时用的合成请求号。
     next_synthetic_request: AtomicU64,
+    /// `simplify_invoke` 的操作号（不是 TDLib 请求号）。
+    next_simplify_request: AtomicU64,
+    /// 正在跑的 simplify 工作线程数（只用于告警，见 [`SIMPLIFY_BUSY_WORKERS`]）。
+    simplify_workers: AtomicU64,
     /// 已经发出的请求留档（诊断 + 测试用）。
     sent_requests: Mutex<VecDeque<SentRequest>>,
     /// 内置 scope service 的 vtable（`context` 指向本实例）。按值存，地址稳定。
@@ -367,6 +385,8 @@ impl HostRuntime {
             tool_list_cache: Mutex::new(None),
             request_owners: Mutex::new(RequestOwners::default()),
             next_synthetic_request: AtomicU64::new(SYNTHETIC_REQUEST_BASE),
+            next_simplify_request: AtomicU64::new(SIMPLIFY_REQUEST_BASE),
+            simplify_workers: AtomicU64::new(0),
             sent_requests: Mutex::new(VecDeque::new()),
             // scope service 的 `context` 指向这个 Arc 内部（和 host_ctx 一个道理）。
             scope_vtable: ServiceVTable {
@@ -414,6 +434,8 @@ impl HostRuntime {
                 get_config: Some(api_get_config),
                 set_config: Some(api_set_config),
                 provide_service_shared: Some(api_provide_service_shared),
+                simplify_invoke: Some(api_simplify_invoke),
+                simplify_invoke_result: Some(api_simplify_invoke_result),
             },
         });
         rt.provide_scope_service();
@@ -833,6 +855,23 @@ impl HostRuntime {
         });
     }
 
+    /// 登记一条 **simplify 操作号**的归属：结果回来时按它定向投递。
+    ///
+    /// 与 [`Self::record_request`] 的区别：这个号**不是**发给 TDLib 的请求，
+    /// 所以不进 `sent_requests`（那条留档是「宿主替插件发出去了什么」），
+    /// 但仍然要进归属表——不然结果只能全局广播，别人也收得到。
+    fn record_simplify(&self, id: u64, owner: u64) {
+        self.request_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, owner);
+    }
+
+    /// 下一个 simplify 操作号。
+    fn next_simplify_id(&self) -> u64 {
+        self.next_simplify_request.fetch_add(1, Ordering::Relaxed)
+    }
+
     // ── 插件作用域 ─────────────────────────────────────────────
 
     fn begin_plugin(&self) -> u64 {
@@ -1049,6 +1088,25 @@ unsafe fn runtime<'a>(host: *mut c_void) -> Option<&'a HostRuntime> {
         // SAFETY: 由调用方保证。
         Some(unsafe { &*(host as *const HostRuntime) })
     }
+}
+
+/// 把 `host_ctx` 换成一份**自己持有**的 [`Arc`]，好交给跨线程的工作函数。
+///
+/// 存在的理由：simplify 的操作要阻塞等 TDLib 应答，不能在调用它的那个线程上跑
+/// （那通常是投递更新的线程，等下去就是死锁）。工作线程得自己持有一份强引用，
+/// 否则宿主可能先被释放。
+///
+/// # Safety
+/// 同 [`runtime`]，且此刻强计数必须 > 0（调用来自插件，插件自己就持有一份）。
+unsafe fn runtime_arc(host: *mut c_void) -> Option<Arc<HostRuntime>> {
+    if host.is_null() {
+        return None;
+    }
+    // SAFETY: `host_ctx` 是 `HostRuntime::new` 里 `Arc::new_cyclic` 给的地址
+    // （见那里的 `weak.as_ptr()`），也就是 Arc 内层的地址，所以按 Arc 加计数是合法的。
+    unsafe { Arc::increment_strong_count(host as *const HostRuntime) };
+    // SAFETY: 同上；刚刚加过一次计数，这份 Arc 由本函数返回给调用方持有。
+    Some(unsafe { Arc::from_raw(host as *const HostRuntime) })
 }
 
 /// # Safety
@@ -1840,6 +1898,97 @@ unsafe extern "C" fn api_td_execute(
     }
 }
 
+/// **跨语言**的 simplify 操作（ABI v5）：起一个工作线程跑它，结果走 `"response"` 通道回给发起插件。
+///
+/// 不在调用线程上跑的理由：op 内部要阻塞等 TDLib 应答（等响应、等发送结局），
+/// 而调用方往往正站在**投递更新**的那个线程上——在那儿等就是自己等自己。
+///
+/// 工作线程的归属是**宿主自己**（`owner = 0`），所以它顺手发出的那些 TDLib 请求
+/// 的中间响应只会到全局订阅者，不会漏给插件；插件最终只收到一条
+/// `{"@type":"simplifyResult",…,"request_id":<本函数返回的号>}`。
+unsafe extern "C" fn api_simplify_invoke(host: *mut c_void, op_json: *const c_char) -> RequestId {
+    // SAFETY: ABI 契约保证 host 来自本运行时；这里要一份能跨线程的强引用。
+    let Some(rt) = (unsafe { runtime_arc(host) }) else {
+        return RequestId::INVALID;
+    };
+    let Some(request) = parse_json(op_json) else {
+        rt.warn("simplify_invoke 收到了非法 JSON");
+        return RequestId::INVALID;
+    };
+    let op = request
+        .get(SIMPLIFY_OP_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if op.is_empty() {
+        rt.warn("simplify_invoke 的 op JSON 里没有 op 名");
+        return RequestId::INVALID;
+    }
+    if ops::is_sync_op(&op) {
+        rt.warn(&format!(
+            "simplify op `{op}` 是同步操作，回调里该走 simplify_invoke_result（照跑，只是白占一个线程）"
+        ));
+    }
+
+    let owner = rt.current_owner();
+    let id = rt.next_simplify_id();
+    rt.record_simplify(id, owner);
+
+    let busy = rt.simplify_workers.fetch_add(1, Ordering::Relaxed) + 1;
+    if busy >= SIMPLIFY_BUSY_WORKERS as u64 {
+        rt.warn(&format!(
+            "同时跑着的 simplify 操作有 {busy} 个，检查一下插件是不是在刷"
+        ));
+    }
+    // spawn 的闭包拿走 `rt` / `op` / `request` 的所有权；失败的分支里要用 `op`，先留一份。
+    let spawn = std::thread::Builder::new()
+        .name(format!("fy-simplify-{op}"))
+        .spawn({
+            let rt = Arc::clone(&rt);
+            let op = op.clone();
+            let request = request.clone();
+            move || rt.run_simplify(id, &op, &request)
+        });
+    if let Err(e) = spawn {
+        rt.warn(&format!("simplify op `{op}` 起不了工作线程: {e}"));
+        rt.simplify_workers.fetch_sub(1, Ordering::Relaxed);
+        return RequestId::INVALID;
+    }
+    RequestId { id }
+}
+
+/// **同步**的 simplify 操作（ABI v5）：只收不碰网络的 op，当场返回结果 JSON。
+///
+/// 同步 op 底层是 `td_execute` 或纯本地计算，所以在**更新回调里也安全**——
+/// 不像 [`api_simplify_invoke`] 那样会卡住投递线程。
+unsafe extern "C" fn api_simplify_invoke_result(
+    host: *mut c_void,
+    op_json: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    let request = parse_json(op_json).unwrap_or(Value::Null);
+    let op = request
+        .get(SIMPLIFY_OP_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    // 认不出的 op 也放进去跑：`run` 会给出 `unknown_op`，比在这里猜「它大概是异步的」准确。
+    let outcome = if ops::is_sync_op(&op) || !ops::known_ops().contains(&op.as_str()) {
+        ops::run(&rt.simplify(), &request)
+    } else {
+        Err(ops::OpError::new(
+            "async_op",
+            format!(
+                "`{op}` 要等 TDLib 应答，不能在这里同步跑；请用 simplify_invoke 并等 `response` 事件"
+            ),
+        ))
+    };
+    host_string(&ops::to_result_json(&op, outcome).to_string())
+}
+
 unsafe extern "C" fn api_use_middleware(
     host: *mut c_void,
     stage: u32,
@@ -2006,6 +2155,34 @@ unsafe extern "C" fn api_set_config(
 }
 
 impl HostRuntime {
+    /// 一份对着**宿主自己** vtable 的 [`Simplify`]。
+    ///
+    /// 宿主跑 simplify op 用的就是它——与 Rust 插件里那个 `Simplify` 是**同一个实现**，
+    /// 所以「Rust 的人话方法」和「别的语言的 op JSON」行为完全一致，差别只在入参。
+    fn simplify(&self) -> Simplify {
+        // SAFETY: vtable 由本实例持有，调用期间一定活着。
+        let host = unsafe { HostApi::from_raw(self.vtable_ptr()) }
+            .expect("宿主自己的 vtable 一定版本自洽、字段齐全");
+        Simplify::new(host)
+    }
+
+    /// 在工作线程里跑一个 simplify op，把结果投递回发起它的插件。
+    ///
+    /// 工作线程**不压作用域栈**，所以 `current_owner()` 是 0：op 内部顺手发出的
+    /// TDLib 请求算宿主的，它们的中间响应只到全局订阅者，插件看不见。
+    fn run_simplify(self: Arc<Self>, id: u64, op: &str, request: &Value) {
+        let outcome = ops::run(&self.simplify(), request);
+        let mut payload = ops::to_result_json(op, outcome);
+        if let Value::Object(map) = &mut payload {
+            map.insert("request_id".to_owned(), json!(id));
+        }
+        // 归属在 `api_simplify_invoke` 里就登记过了，这里只管投递。
+        if let Err(e) = self.deliver_response(&payload) {
+            self.warn(&format!("simplify op `{op}` 的结果没投出去: {e}"));
+        }
+        self.simplify_workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
     fn td_send(&self, request: Value) -> RequestId {
         let method = request
             .get("@type")
@@ -2725,6 +2902,108 @@ mod tests {
             "{:?}",
             rt.sent_requests()
         );
+    }
+
+    /// simplify 的**同步**入口（ABI v5）：纯计算类的 op 当场返回结果。
+    #[test]
+    fn simplify_invoke_result_runs_the_sync_ops_inline() {
+        let rt = runtime();
+        // SAFETY: vtable 活着。
+        let api = unsafe { HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        // 没接 TDLib 时 `formatted` 退回纯文本，所以这条离线也成立。
+        let parsed: Value = serde_json::from_str(&api.simplify_invoke_result(
+            r#"{"op":"parse_text_entities","args":{"text":"*hi*","parse_mode":"markdown"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(parsed["ok"], true, "{parsed}");
+        assert_eq!(parsed["result"]["@type"], "formattedText");
+        assert_eq!(parsed["result"]["text"], "*hi*");
+
+        // 富消息：本地 Markdown → `inputRichMessage`，这是别的语言唯一能拿到它的路子。
+        let rich: Value = serde_json::from_str(&api.simplify_invoke_result(
+            r##"{"op":"rich_from_markdown","args":{"markdown":"# t\n\nbody"}}"##,
+        ))
+        .unwrap();
+        assert_eq!(rich["ok"], true, "{rich}");
+        assert_eq!(rich["result"]["@type"], "inputMessageRichText");
+        assert_eq!(rich["result"]["rich_message"]["@type"], "inputRichMessage");
+
+        // 自描述：操作表本身可以问出来
+        let listed: Value =
+            serde_json::from_str(&api.simplify_invoke_result(r#"{"op":"list_ops"}"#)).unwrap();
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert!(
+            listed["result"]["async"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op == "send_message")),
+            "异步表里有 send_message：{listed}"
+        );
+
+        // 认不出的 op：明确报错，不静默
+        let unknown: Value =
+            serde_json::from_str(&api.simplify_invoke_result(r#"{"op":"nope"}"#)).unwrap();
+        assert_eq!(unknown["ok"], false, "{unknown}");
+        assert_eq!(unknown["error"]["code"], "unknown_op");
+
+        // 异步 op 不许走同步入口（会卡住投递线程）
+        let blocked: Value = serde_json::from_str(
+            &api.simplify_invoke_result(r#"{"op":"send_message","args":{"chat_id":1}}"#),
+        )
+        .unwrap();
+        assert_eq!(blocked["ok"], false, "{blocked}");
+        assert_eq!(blocked["error"]["code"], "async_op");
+    }
+
+    /// simplify 的**异步**入口（ABI v5）：op 在宿主的工作线程里跑，结果按 `request_id` 回到发起者。
+    ///
+    /// 这条测试同时钉住两件事：① op 内部发出的 TDLib 请求**照旧**进 `sent_requests`
+    /// （说明它真的走了宿主那条路）；② 结果只以 `simplifyResult` 的形状回来一次。
+    #[test]
+    fn simplify_invoke_hands_the_result_back_through_the_response_channel() {
+        let rt = runtime();
+        // SAFETY: vtable 活着。
+        let api = unsafe { HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        let id = api
+            .simplify_invoke(
+                r#"{"op":"delete_messages","args":{"chat_id":1,"message_ids":[7],
+                    "revoke":true,"timeout_ms":5000}}"#,
+            )
+            .unwrap();
+        assert!(id.is_valid(), "操作号必须有效");
+
+        // 模拟 TDLib：看到 `deleteMessages` 就回一条 ok
+        let responder = {
+            let rt = Arc::clone(&rt);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    let target = rt
+                        .sent_requests()
+                        .into_iter()
+                        .find(|request| request.method == "deleteMessages");
+                    if let Some(request) = target {
+                        let _ = rt.deliver_response(
+                            &json!({"@type":"ok","@extra": request.id.to_string()}),
+                        );
+                        return;
+                    }
+                }
+            })
+        };
+
+        let filter =
+            json!({ FILTER_EVENT_TYPE_KEY: RESPONSE_EVENT, "request_id": id.id }).to_string();
+        let handle = api.wait_for_update(&filter, 5000);
+        responder.join().unwrap();
+        assert!(handle.did_match(), "结果必须回到 response 通道");
+        // SAFETY: 宿主保证这个指针在下一次宿主调用之前有效，这里立刻读完。
+        let text = unsafe { CStr::from_ptr(handle.payload_json) }.to_string_lossy();
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["op"], "delete_messages", "{payload}");
+        assert_eq!(payload["ok"], true, "{payload}");
+        assert_eq!(payload["result"]["@type"], "ok");
     }
 
     /// 用插件视角的 `HostApi` 走一遍全部能力，证明桥接真的通。

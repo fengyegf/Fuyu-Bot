@@ -16,6 +16,9 @@ fuyubot-core.workspace = true
 fuyubot-event.workspace = true
 fuyubot-middleware.workspace = true
 fuyubot-service.workspace = true
+# 宿主侧跑 simplify 的 op 表（ABI v5 `simplify_invoke`）：与 Rust 插件共用同一份实现，
+# 所以跨语言的行为不会有第二套。方向是 loader → simplify，没有回边。
+fuyubot-simplify.workspace = true
 fuyubot-tdlib.workspace = true
 fuyubot-tool.workspace = true
 libloading.workspace = true

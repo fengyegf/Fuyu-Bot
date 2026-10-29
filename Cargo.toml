@@ -7,9 +7,10 @@ resolver = "3"
 
 [workspace.package]
 # 0.1.0 是首次公开版本（crates.io 上这两个 crate 之前一个版本都没有）。
-# 0.1.1 给 `HostApiVTable` 尾部加了 `provide_service_shared`（服务作用域），
-# 属于破坏性改动，所以 SDK 侧的依赖也一起顶到 0.1.1。
-version = "0.1.1"
+# 0.1.1 给 `HostApiVTable` 尾部加了 `provide_service_shared`（服务作用域）。
+# 0.1.2 加了 `simplify_invoke` / `simplify_invoke_result`（ABI 4 → 5，simplify 下沉到宿主）——
+# 都是破坏性改动，所以 SDK 侧的依赖也一起顶到最新版。
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -17,17 +18,17 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
-fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.1" }
-fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.1" }
-fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.1" }
-fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.1" }
-fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.1" }
-fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.1" }
-fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.1" }
-fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.1" }
-fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.1" }
-fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.1" }
-fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.1" }
+fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.2" }
+fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.2" }
+fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.2" }
+fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.2" }
+fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.2" }
+fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.2" }
+fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.2" }
+fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.2" }
+fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.2" }
+fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.2" }
+fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.2" }
 
 cbindgen = "0.29.4"
 clap = { version = "4.6.7", features = ["derive"] }

@@ -3,7 +3,7 @@
 ## 这是什么
 
 基于 TDLib 的 Telegram bot / user 框架：**一个宿主进程 + N 个动态库插件**。
-插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 4）。
+插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 5）。
 TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` 在**编译期**转成 Rust 类型与可校验元数据。
 
 三个仓库（本仓只放运行时）：
@@ -22,12 +22,12 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | --- | --- |
 | `fuyubot-cli` | 二进制 `fuyubot`：`init` / `run` / `status` / `stop` / `config` / `plugin`（clap） |
 | `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
-| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 19 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
+| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 23 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
 | `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机） |
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
 | `fuyubot-loader` | 唯一宿主层：VTable 桥、更新管线、插件加载、注册回滚 |
-| `fuyubot-simplify` | TDLib 便捷封装（发消息 / 编辑 / Markdown → entities / 命令解析） |
+| `fuyubot-simplify` | TDLib 便捷封装（发消息 / 编辑 / Markdown → entities / 命令解析）；`ops` 模块是它的 JSON 操作表，宿主 ABI v5 的 `simplify_invoke*` 就跑它 |
 | `fuyubot-plugin-*` | demo / badabi 测试插件 + 三个内置插件（`/start`、`/help`、`/plugins`） |
 
 数据流：插件的 `on/invoke/emit/middleware` → `HostApiVTable` → `HostRuntime`（事件总线 / 服务 / 工具 / 管线 / TdClient）
@@ -162,6 +162,15 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 55. **新增插件导出符号要三处同步**：`fuyubot-abi` 的 `SYM_*` 常量、`build.rs` 的 `TRAILER`（手写声明）、SDK 的 `sdk check` 的 `ABI_SYMBOLS`。约束 18 只管**类型**（`export.include`），不管函数声明——ABI v4 的 `plugin_manifest` / `fuyubot_abi_version` / `plugin_free_handle` 就漏在头文件外过一轮，C 作者据此**根本不知道要写**。`TRAILER` 里用到 ABI 类型的声明必须留在 trailer（`after_includes` 在所有类型定义之前，放那儿 `-fsyntax-only` 直接报错，约束 33）。
 56. **`plugin_manifest` 的 `version` 取 `env!("CARGO_PKG_VERSION")`**（宏在调用点展开，所以是**插件 crate** 的版本，不是 abi 的）：它是真值，不是 `"0.0.0"` 占位。所有字符串过 `quote()` 转义（`"` / `\` / `< 0x20` → `\u00XX`），非 ASCII 原样写 UTF-8。宿主侧 `declared()` 的优先级是「manifest 该侧非空 → 用它，否则回退 `[plugin.<名>].inject`」，**覆盖而非合并、且逐侧判定**——所以插件一旦声明 `inject`，配置里那份就静默失效。
 57. **`plugin_free_handle` 的签名永久冻结**：`void plugin_free_handle(PluginHandle)` 只接 handle 本身、**不碰 VTable**，宿主正是在「版本对不上、VTable 一律不可信」那一刻调它（`probe` 与 `load_with_config` 两条路径都必须调，否则 `init` 里分配的状态就漏了）。所以它不能加参数、不能改语义——改了等于让老宿主在未来的插件上乱调。没导出它的 v3 插件只能像以前一样把状态留在那儿，`load` 照样返回 `AbiMismatch`。
+
+58. **simplify 下沉成 op JSON 分发，不是一个方法一个函数指针**（ABI v5，`docs/decisions.md` 变更 12）：
+    宿主侧实现在 `fuyubot-simplify::ops`，`HostRuntime::run_simplify` 调它——与 Rust 插件用的是
+    **同一个** `Simplify`，不存在第二套行为。加操作 = 往 `SYNC_OPS` / `ASYNC_OPS` 与 `dispatch`
+    里加一项，**不动 ABI**。异步 op 只能走 `simplify_invoke`（宿主起工作线程跑，结果照 `@request_id`
+    回投）；同步 op（`parse_text_entities` / `rich_from_markdown` / `list_ops`）走
+    `simplify_invoke_result`，回调里安全，传异步 op 返回 `code:"async_op"`。
+    ⚠️ op 工作线程的归属是**宿主自己**（`owner = 0`），它顺手发出的 TDLib 请求的中间响应只到
+    全局订阅者——插件只该收到最后那一条 `simplifyResult`。
 
 ## 文档
 

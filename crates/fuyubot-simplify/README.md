@@ -37,3 +37,14 @@ TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删�
 - `InputPageBlock` 一共 24 个构造器，本地转换器**全都能产出**（`thinking` 只能出现在草稿消息里，结构上仍可构造）；`with_block` 留给「媒体已经上传、要传 `inputPhoto` 句柄」这类 md 表达不了的场景。分工表在 `input_page_block_coverage_is_accounted_for` 测试里，加块/删块会让它失败；
 - 块级语法**按官方 Rich Markdown 表一类一例**在 `block_syntax_covers_the_official_table` 里断言（每一块都会再走一遍 `td_api::InputPageBlock` 反序列化），整段全格式的回归闸是内联的 `official_sample_fully_deserializes`；
 - 行内表达式是独立的 `RichText`（31 个构造器、没有 offset/length）：Markdown 覆盖 21 个，剩下 10 个（`mention` / `hashtag` / `cashtag` / `bankCardNumber` / `tonAddress` / `botCommand` / `icon` / `button` / `diff` / `anchor`）没有 md 语法，用 `richtext::*` 拼好塞进块。31 个全部有反序列化测试。
+
+## `ops`：同一套语义的 JSON 入口（ABI v5）
+
+`ops` 模块把上面的语义做成**一张 op 表**：`run(&simplify, &json!({"op":"…","args":{…}}))`。
+
+- **宿主**（`fuyubot-loader`）用它实现 ABI v5 的 `simplify_invoke` / `simplify_invoke_result`，所以
+  Go / C / JS / TS / Python 插件调的是**同一份实现**——不存在「Rust 一套、别的语言另一套」。
+- **Rust 插件**也能直接调它，但它更该用上面的类型化方法（有编译期检查）。
+- 同步 op（`parse_text_entities` / `rich_from_markdown` / `list_ops`）不碰网络，回调里安全；
+  其余要等 TDLib 应答，只能走 `simplify_invoke`。
+- 加操作 = 往 `SYNC_OPS` / `ASYNC_OPS` 里加一个名字 + 一个分支，**不动 ABI**。

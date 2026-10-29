@@ -22,9 +22,19 @@ pub use response::{ResponseFuture, ResponseRouter, UpdateFuture};
 
 /// ABI 版本。字段只增不改，新增一律追加在尾部。
 ///
-/// 经 [`HostApiVTable::get_config`] 与 [`HostApiVTable::set_config`]，
-/// 插件可读取全局配置（自己的段 + 别人的段），但**只能写自己的段**。
-pub const ABI_VERSION: u32 = 4;
+/// - v3：`get_config` / `set_config`（读写插件配置段）。
+/// - v4：`provide_service_shared`（进程级服务）、插件导出 `plugin_manifest` 等三个符号。
+/// - v5：`simplify_invoke` / `simplify_invoke_result`——把 `fuyubot-simplify` 的
+///   **语义**（发消息等结局、超时撤回、bot 与用户号挑不同方法、Markdown → entities）
+///   下沉到宿主，用 **op JSON 分发**，所有语言的插件都能用。
+pub const ABI_VERSION: u32 = 5;
+
+/// `simplify_invoke` 的 op JSON 里「要跑哪个操作」的键名。
+pub const SIMPLIFY_OP_KEY: &str = "op";
+/// `simplify_invoke` 的 op JSON 里「这个操作的入参」的键名。
+pub const SIMPLIFY_ARGS_KEY: &str = "args";
+/// simplify 结果的 `@type`：成功与失败都用这一个，靠 `ok` 区分。
+pub const SIMPLIFY_RESULT_TYPE: &str = "simplifyResult";
 
 /// cbindgen 生成的头文件**原文**。
 ///
@@ -422,9 +432,35 @@ pub struct HostApiVTable {
             vtable: *const ServiceVTable,
         ) -> ServiceHandle,
     >,
+    /// **跨语言**跑一个 `fuyubot-simplify` 操作（ABI v5）。
+    ///
+    /// `op_json` 的形状是 `{"op":"<名字>","args":{…}}`，例如
+    /// `{"op":"send_message","args":{"chat_id":123,"input_message_content":{…}}}`。
+    /// 操作表由宿主提供（**不是**一个方法一个函数指针），加操作**不动 ABI**。
+    ///
+    /// 返回请求号；结果照 [`RESPONSE_EVENT`] 那条既有通道回到**发起它的插件**
+    /// （事件类型 `"response"`，负载里带 `request_id` 与 `request_id` 之外的
+    /// `{"@type":"simplifyResult","op":…,"ok":true,"result":…}`；失败时
+    /// `"ok":false` + `"error":{"code":…,"message":"…"}`）。也就是说 JS/TS 的
+    /// `invokeAsync`、Python 的 `invoke_async`、Go 的 channel、Rust 的
+    /// [`ResponseRouter`] 都能原样接住，不需要新的回投机制。
+    ///
+    /// ⚠️ 这是**异步**入口：宿主在别的线程里跑操作（它会阻塞等 TDLib 应答）。
+    /// 回调里要「当场拿到结果」的纯计算类操作走
+    /// [`Self::simplify_invoke_result`]。
+    pub simplify_invoke:
+        Option<unsafe extern "C" fn(host: *mut c_void, op_json: *const c_char) -> RequestId>,
+    /// **同步**跑一个 simplify 操作，当场返回结果的 JSON（线程局部缓冲，读完即弃）。
+    ///
+    /// 只接受**不碰网络**的操作（`parse_text_entities`、`rich_from_markdown` 等）：
+    /// 它们底层走 `td_execute` 或纯本地计算，所以在**回调里也安全**——
+    /// 不像 [`Self::simplify_invoke`] 那样会卡住投递线程。
+    /// 传了异步操作会返回 `{"@type":"simplifyResult","ok":false,"error":{…}}`。
+    pub simplify_invoke_result:
+        Option<unsafe extern "C" fn(host: *mut c_void, op_json: *const c_char) -> *const c_char>,
 }
 
-/// VTable 就是「两个 u32 + 20 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 23 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -432,9 +468,9 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    // 21 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
+    // 23 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
     // 它是「结构没被悄悄改动」的唯一守卫，比 offset 断言更能发现加/删字段。
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 21 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 23 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -529,6 +565,8 @@ pub struct HostApi {
     log: unsafe extern "C" fn(*mut c_void, u32, *const c_char),
     get_config: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> *const c_char,
     set_config: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> i32,
+    simplify_invoke: unsafe extern "C" fn(*mut c_void, *const c_char) -> RequestId,
+    simplify_invoke_result: unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_char,
 }
 
 impl std::fmt::Debug for HostApi {
@@ -602,6 +640,8 @@ impl HostApi {
             log: required!(log),
             get_config: required!(get_config),
             set_config: required!(set_config),
+            simplify_invoke: required!(simplify_invoke),
+            simplify_invoke_result: required!(simplify_invoke_result),
         })
     }
 
@@ -929,6 +969,30 @@ impl HostApi {
         } else {
             Err(AbiError::HostCall(code))
         }
+    }
+
+    /// **跨语言**的 simplify 操作（异步）：返回请求号，结果走 `"response"` 通道回来。
+    ///
+    /// `op_json` 形如 `{"op":"send_message","args":{…}}`。可用操作见
+    /// [`HostApiVTable::simplify_invoke`] 与文档站；不认识的 op 也会拿到请求号，
+    /// 结果里是 `ok:false` 的 `unknown_op` 错误——不会静默。
+    pub fn simplify_invoke(&self, op_json: &str) -> Result<RequestId, AbiError> {
+        let op = CString::new(op_json).map_err(|_| AbiError::BadString)?;
+        // SAFETY: 同 log。
+        Ok(unsafe { (self.simplify_invoke)(self.host_ctx, op.as_ptr()) })
+    }
+
+    /// **同步**的 simplify 操作：当场返回结果 JSON，只能在**不碰网络**的 op 上用。
+    ///
+    /// 返回的 JSON 形如 `{"@type":"simplifyResult","op":…,"ok":true,"result":…}`。
+    /// 宿主临时的字符串，读完即弃。
+    pub fn simplify_invoke_result(&self, op_json: &str) -> String {
+        let Some(op) = CString::new(op_json).ok() else {
+            return String::new();
+        };
+        // SAFETY: 同 log；宿主保证返回的指针在读完之前有效。
+        let raw = unsafe { (self.simplify_invoke_result)(self.host_ctx, op.as_ptr()) };
+        unsafe { cstr_to_string(raw) }
     }
 }
 
@@ -1355,6 +1419,15 @@ mod tests {
     ) -> i32 {
         -1
     }
+    unsafe extern "C" fn noop_simplify_invoke(_: *mut c_void, _: *const c_char) -> RequestId {
+        RequestId::INVALID
+    }
+    unsafe extern "C" fn noop_simplify_invoke_result(
+        _: *mut c_void,
+        _: *const c_char,
+    ) -> *const c_char {
+        core::ptr::null()
+    }
 
     fn test_vtable() -> HostApiVTable {
         HostApiVTable {
@@ -1381,6 +1454,8 @@ mod tests {
             get_config: Some(noop_get_config),
             set_config: Some(noop_set_config),
             provide_service_shared: Some(noop_provide_shared),
+            simplify_invoke: Some(noop_simplify_invoke),
+            simplify_invoke_result: Some(noop_simplify_invoke_result),
         }
     }
 

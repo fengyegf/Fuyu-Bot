@@ -99,7 +99,10 @@ pub use fuyubot_tdlib_sys::td_api;
 
 mod chat;
 mod connection;
+pub mod ops;
 mod rich;
+
+pub use ops::{OpError, is_sync_op, known_ops, run, to_result_json};
 
 pub use chat::{
     AdminRight, ForwardParams, MAX_FORWARD_MESSAGES, Reaction, chat_member_params, forward_params,

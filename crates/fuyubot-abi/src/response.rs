@@ -711,6 +711,18 @@ mod tests {
     ) -> i32 {
         -1
     }
+    unsafe extern "C" fn noop_simplify_invoke(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+    ) -> crate::RequestId {
+        crate::RequestId::INVALID
+    }
+    unsafe extern "C" fn noop_simplify_invoke_result(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+    ) -> *const core::ffi::c_char {
+        core::ptr::null()
+    }
 
     fn fake_vtable() -> HostApiVTable {
         HostApiVTable {
@@ -737,6 +749,8 @@ mod tests {
             get_config: Some(noop_get_config),
             set_config: Some(noop_set_config),
             provide_service_shared: Some(noop_provide_shared),
+            simplify_invoke: Some(noop_simplify_invoke),
+            simplify_invoke_result: Some(noop_simplify_invoke_result),
         }
     }
 
