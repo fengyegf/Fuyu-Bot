@@ -3,14 +3,19 @@ name: Build TDLib
 # Build follows https://tdlib.github.io/td/build.html (official CMake + tdjson).
 # Extra on top: OpenSSL/zlib statically merged into tdjson (static flags / triplets).
 #
+# ⚠️ 职责边界：**这个 workflow 只产 TDLib（tdjson 动态库）**，不编 `fuyubot` 本体。
+#    `fuyubot` 二进制 / 内置插件 / zip / Release 全在 `release-bot.yml`（含 Android）。
+#    这边跑完把产物交出去就结束了：桌面走 Release 资产，Android 走 workflow artifact。
+#
 # ⚠️ 当前状态：**只构建 Android**（`build-android` job）。桌面五个平台暂时全部停用
 #    （`desktop` 表里 `enabled: false`），恢复时把对应项改回 `true` 即可，别删表——
 #    `crates/fuyubot-tdlib/tests/release_assets.rs` 会读这张表逐行比对 loader 的 `ASSET_*`。
 #
-# 两条互不干扰的产物：
+# 两种产物：
 #   - 桌面：`TDLib-<os>-<arch>`，是 **loader 的发布资产**（tag `TDLib-v<版本>`），走 `assemble` + Release。
 #   - Android：`tdjson-android-<abi>`，**不是** loader 资产（loader 只认 windows/macos/linux），
-#     只作为 workflow artifact 上传，不进 Release，也不参与 `SHA256SUMS` 契约。
+#     只作为 workflow artifact 上传；`release-bot.yml` 的 `build-android` 会去取它
+#     （先看 Release 上的 `TDLib-android-<arch>`，没有就退回这里最近一次成功的 artifact）。
 #
 # Windows / vcpkg PITFALL:
 #   Use the runner's preinstalled vcpkg as-is (latest).
@@ -584,122 +589,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # ---------------- Android 框架本体（可执行文件，不是 apk）----------------
-  # 复用上面刚编出来的 tdjson（同一次运行的 artifact），把 fuyubot 交叉编译成
-  # **Android 可执行文件**（`aarch64-linux-android` / `x86_64-linux-android` 的 ELF）。
-  # 包里是 `fuyubot` + **同级**的 `libtdjson.so` + `plugins/`：
-  # loader 的优先级 2b（可执行文件目录，靠 `/proc/self/exe`）负责找到 tdjson，
-  # 所以整个目录搬到设备上（Termux / adb push）就能跑，不需要碰系统库。
-  #
-  # 与 release-bot.yml 的关系：那边是 `.tdlib-cache/<版本>/<os>-<arch>/` 这个约定布局让
-  # `fuyubot-tdlib/build.rs` 把库拷到可执行文件旁边；这里**同一套布局**，只是库来自本次运行的
-  # artifact（Android 的 tdjson 还不是 Release 资产，见 `vendored.rs` 里 ASSETS 的注释）。
-  build-framework-android:
-    name: fuyubot-${{ matrix.arch }}
-    needs: [resolve-tdlib, build-android]
-    # 同上：只用 `needs`（`build-android` 被 skip 时这里也自然 skip）
-    if: needs.build-android.result == 'success'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.resolve-tdlib.outputs.android_matrix) }}
-    env:
-      ANDROID_NDK_VERSION: "28.2.13676358"
-      ANDROID_API_LEVEL: "21"
-      CARGO_TERM_COLOR: always
-      TDLIB_VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install host build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          # 这一步只编 Rust（tdjson 已经由上一个 job 建好），但依赖树里有 C 代码
-          # （`fuyubot-tdlib-sys` 的 build-dependency `ureq` → `ring`，按 **host** 编译），
-          # 所以要有 host 的 cc/ld。runner 镜像自带，这里显式写出来免得换镜像时踩空。
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential ca-certificates
-
-      - name: Install Android NDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          NDK="$SDK/ndk/$ANDROID_NDK_VERSION"
-          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
-            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null || true
-          fi
-          {
-            echo "ANDROID_NDK_HOME=$NDK"
-            echo "ANDROID_NDK_ROOT=$NDK"
-            echo "ANDROID_SDK_ROOT=$SDK"
-          } >> "$GITHUB_ENV"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Download the Android tdjson built in this run
-        uses: actions/download-artifact@v4
-        with:
-          name: tdlib-${{ needs.resolve-tdlib.outputs.tdlib_version }}-android-${{ matrix.abi }}
-          path: tdjson-artifact
-
-      - name: Stage tdjson into the build cache layout
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 布局必须与 `vendored::relative_library_dir()` 一致：<缓存根>/<版本>/<os>-<arch>
-          dest=".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}"
-          mkdir -p "$dest" tdjson-artifact/unpacked
-          tar -xzf "tdjson-artifact/${{ matrix.artifact }}" -C tdjson-artifact/unpacked
-          cp -a "tdjson-artifact/unpacked/${{ matrix.artifact }}/." "$dest/"
-          ls -lh "$dest"
-
-      - name: Make scripts executable
-        shell: bash
-        run: chmod +x .github/scripts/*.sh
-
-      - name: Build fuyubot for Android
-        shell: bash
-        env:
-          FUYUBOT_TDLIB_VENDORED_CACHE: ${{ github.workspace }}/.tdlib-cache
-        run: |
-          set -euo pipefail
-          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
-          triple="${{ matrix.target }}"
-          # cargo 的 linker 环境变量名是 `CARGO_TARGET_<TRIPLE 大写下划线>_LINKER`。
-          upper="$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')"
-          linker="$toolchain/bin/${triple}${ANDROID_API_LEVEL}-clang"
-          export "CARGO_TARGET_${upper}_LINKER=$linker"
-          # cc-rs 的变量名是 `CC_<triple 下划线>`（当前依赖图里没有 crate 用它，留着不吃亏）
-          export "CC_${triple//-/_}=$linker"
-          export "AR_${triple//-/_}=$toolchain/bin/llvm-ar"
-          echo "==> linker: $linker"
-          cargo build --release --target "$triple" \
-            -p fuyubot-cli \
-            -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
-          ls -lh "target/$triple/release/fuyubot"
-
-      - name: Package fuyubot for Android
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          .github/scripts/package-bot-android.sh \
-            "${{ matrix.target }}" "${{ matrix.arch }}" "$TDLIB_VERSION" \
-            "${{ needs.resolve-tdlib.outputs.tdlib_commit }}" dist
-
-      - name: Upload fuyubot artifact (Android)
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuyubot-${{ needs.resolve-tdlib.outputs.tdlib_version }}-android-${{ matrix.abi }}
-          path: dist/*.tar.gz
-          if-no-files-found: error
-          retention-days: 30
+  # ⚠️ 框架本体（含 Android 可执行文件）**不在这里**：本 workflow 只负责产 TDLib
+  #    （`TDLib-*` 给 loader，`tdjson-android-<abi>` 给 Android 框架构建用）。
+  #    `fuyubot` 二进制的构建全部在 `release-bot.yml`（那边才有"产品"的概念：
+  #    版本号、plugins/、zip、Release）。Android 的框架 job 也在那边。
 
   assemble:
     name: Assemble release bundle
@@ -873,7 +766,7 @@ jobs:
 
   summary:
     name: Summary
-    needs: [resolve-tdlib, export-schema, build, build-android, build-framework-android, assemble]
+    needs: [resolve-tdlib, export-schema, build, build-android, assemble]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -887,7 +780,6 @@ jobs:
           ANDROID_PLAN: ${{ needs.resolve-tdlib.outputs.android_plan }}
           BUILD: ${{ needs.build.result }}
           ANDROID_BUILD: ${{ needs.build-android.result }}
-          FRAMEWORK_BUILD: ${{ needs.build-framework-android.result }}
           ASSEMBLE: ${{ needs.assemble.result }}
           SCHEMA: ${{ needs.export-schema.result }}
           PUBLISH: ${{ inputs.publish_release }}
@@ -910,13 +802,12 @@ jobs:
             echo "| Schema export | \`${SCHEMA}\` |"
             echo "| Desktop matrix builds | \`${BUILD}\` |"
             echo "| Android tdjson | \`${ANDROID_BUILD}\` |"
-            echo "| Android fuyubot | \`${FRAMEWORK_BUILD}\` |"
             echo "| Assemble | \`${ASSEMBLE}\` |"
             echo
             echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages + \`SHA256SUMS\`."
             echo
-            echo "Android 的两份产物都只是 workflow artifact，**不进** Release："
-            echo "\`tdjson-android-<abi>\`（动态库）与 \`fuyubot-<版本>-android-<abi>\`（可执行文件 + 同级 tdjson + plugins/）。"
+            echo "本 workflow **只产 TDLib**：桌面 \`TDLib-*\`（loader 的发布资产）与 \`tdjson-android-<abi>\`"
+            echo "（Android 用，只是 workflow artifact）。\`fuyubot\` 二进制与 \`plugins/\` 的构建在 \`release-bot.yml\`。"
             echo "loader 的 \`ASSETS\` 表仍只覆盖 windows / macos / linux。"
             echo
             echo "### Desktop matrix"

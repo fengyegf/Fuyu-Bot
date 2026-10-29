@@ -10,10 +10,12 @@
 # 为什么 tdjson 必须同级：Android 上 `dlopen("libtdjson.so")` 不会去搜 $PWD，
 # 而 loader 的优先级 2b 是用 `/proc/self/exe` 的父目录拼出来的——二进制搬到哪都成立。
 #
-# Args: <target-triple> <arch> <version> <commit> <dist-dir> [tdjson-source-dir]
+# Args: <target-triple> <arch> <version> <commit> <dist-dir> [tdjson-source-dir] [package-name]
 #   target-triple        aarch64-linux-android / x86_64-linux-android
 #   arch                 cargo 口径：aarch64 / x86_64
 #   tdjson-source-dir    含 libtdjson.so 的目录（默认 .tdlib-cache/<version>/android-<arch>）
+#   package-name         包目录名（默认 `fuyubot-android-<arch>`；release-bot 传带版本号的名字，
+#                        这样 publish 打出来的 zip 与桌面口径一致：fuyubot-<版本>-android-<arch>.zip）
 set -euo pipefail
 
 TRIPLE="${1:?target triple}"
@@ -22,9 +24,9 @@ VERSION="${3:?tdlib version}"
 COMMIT="${4:?tdlib commit}"
 DIST="${5:?dist dir}"
 TDLIB_DIR="${6:-.tdlib-cache/${VERSION}/android-${ARCH}}"
+PKG="${7:-fuyubot-android-${ARCH}}"
 
 BIN="target/${TRIPLE}/release/fuyubot"
-PKG="fuyubot-android-${ARCH}"
 STAGE="${DIST}/${PKG}"
 PLUGIN_DIR="target/${TRIPLE}/release"
 
@@ -60,8 +62,9 @@ printf '%s\n' \
   "  /sdcard 挂着 noexec，放那儿跑不起来。" \
   "" \
   "起步：" \
-  "  adb push fuyubot-android-${ARCH} /data/local/tmp/fuyubot && adb shell" \
-  "  cd /data/local/tmp/fuyubot && chmod +x fuyubot" \
+  "  adb push ${PKG}.tar.gz /data/local/tmp/ && adb shell" \
+  "  cd /data/local/tmp && tar -xzf ${PKG}.tar.gz && cd ${PKG}" \
+  "  chmod +x fuyubot" \
   "  ./fuyubot init --dir demo --name mybot --api-id <你的 api_id>" \
   "  ./fuyubot run  --config demo/fuyubot.toml" \
   "" \
