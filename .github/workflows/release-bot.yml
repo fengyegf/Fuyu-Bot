@@ -366,9 +366,14 @@ jobs:
             version="dev-${GIT_SHA:0:7}"
           fi
           pkg="fuyubot-${version}-android-${{ matrix.arch }}"
+          # 参数顺序（见脚本头）：<triple> <arch> <tdlib版本> <tdlib commit> <dist> [tdjson目录] [包名]
+          # ⚠️ 第 6 个是 **tdjson 目录**，不是包名——少写一个就会把包名当成目录，
+          #    报「fuyubot-…-android-aarch64 里没有 libtdjson.so」。
           .github/scripts/package-bot-android.sh \
             "${{ matrix.target }}" "${{ matrix.arch }}" "$TDLIB_VERSION" \
-            "${GIT_SHA}" dist "$pkg"
+            "${GIT_SHA}" dist \
+            ".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}" \
+            "$pkg"
 
       - uses: actions/upload-artifact@v4
         with:
