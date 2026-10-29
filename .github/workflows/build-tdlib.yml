@@ -57,8 +57,10 @@ jobs:
       tdlib_version: ${{ steps.meta.outputs.tdlib_version }}
       tdlib_commit: ${{ steps.meta.outputs.tdlib_commit }}
       build_matrix: ${{ steps.meta.outputs.build_matrix }}
+      desktop_plan: ${{ steps.meta.outputs.desktop_plan }}
       build_count: ${{ steps.meta.outputs.build_count }}
       android_matrix: ${{ steps.meta.outputs.android_matrix }}
+      android_plan: ${{ steps.meta.outputs.android_plan }}
       android_count: ${{ steps.meta.outputs.android_count }}
       selected_targets: ${{ steps.meta.outputs.selected_targets }}
     steps:
@@ -93,10 +95,19 @@ jobs:
           #
           # ⚠️ 桌面五个平台**暂时全部停用**：`enabled: false`。
           #    停用项仍然留在矩阵里（不是注释掉），这样 release_assets.rs 的双向比对照样成立；
-          #    真正决定「建不建」的是 build job 上的 `if: matrix.enabled`。
+          #    ⚠️ **job 级 `if` 拿不到 `matrix` 上下文**：GitHub 在展开矩阵**之前**就求这个
+          #    表达式，`if: matrix.enabled` 会直接
+          #    `Invalid workflow file ... Unrecognized named-value: 'matrix'`。
+          #    所以「建不建」由 `needs.resolve-tdlib.outputs.<count> != '0'` 决定（见各 job），
+          #    这里的矩阵只输出**启用**的行。
+          #    ⚠️ 矩阵还不能为空（`fromJSON` 出来空 include，job 直接报错），所以「一个都没启用」
+          #    时塞一行 `platform: none` 占位——它永远不会真的跑，job 已经被 count 挡掉了。
           #    恢复某个平台 = 把它的 `enabled` 改回 `true`；五个都 `true` 才能发布 Release。
-          MATRIX="$(python3 - <<'PY'
+          PLAN="$(python3 - <<'PY'
           import json
+          import os
+          import sys
+
           desktop = [
               {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-linux-x86_64", "enabled": False},
               {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-linux-aarch64", "enabled": False},
@@ -104,51 +115,71 @@ jobs:
               {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64", "enabled": False},
               {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-aarch64", "enabled": False},
           ]
-          print(json.dumps({"include": desktop}, separators=(",", ":")))
-          PY
-          )"
           # Android：**不是** loader 的发布资产（loader 只认 windows/macos/linux），
           # 所以键名叫 `artifact` 而不是 `asset`——资产名故意不带 `TDLib-` 前缀，
           # 不进 Release、不参与 SHA256SUMS，只作为 workflow artifact 上传。
           # `arch` 仍是 cargo 口径（aarch64 / x86_64），`abi` 是 NDK 的 ABI 名。
-          ANDROID_MATRIX="$(python3 - <<'PY'
-          import json
           android = [
               {"platform": "android", "arch": "aarch64", "abi": "arm64-v8a", "target": "aarch64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-arm64-v8a", "enabled": True},
               {"platform": "android", "arch": "x86_64", "abi": "x86_64", "target": "x86_64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-x86_64", "enabled": True},
           ]
-          print(json.dumps({"include": android}, separators=(",", ":")))
+
+          def enabled(rows):
+              return [row for row in rows if row.get("enabled")]
+
+          def job_matrix(rows, placeholder):
+              rows = enabled(rows)
+              return {"include": rows or [placeholder]}
+
+          desktop_count = len(enabled(desktop))
+          android_count = len(enabled(android))
+          publish = os.environ.get("PUBLISH_RELEASE", "false")
+
+          if publish == "true" and desktop_count != 5:
+              print(
+                  "error: publishing/updating the GitHub Release requires all 5 desktop platforms "
+                  f"enabled (currently {desktop_count});",
+                  file=sys.stderr,
+              )
+              print("       Android-only / partial builds must set publish_release=false", file=sys.stderr)
+              sys.exit(1)
+
+          targets = ", ".join(
+              row["platform"] + "-" + row.get("abi", row["arch"])
+              for row in enabled(desktop) + enabled(android)
+          )
+
+          # 人看的日志走 stderr（stdout 是给下面那段解析的 JSON）
+          print(f"enabled desktop platforms: {desktop_count} / 5", file=sys.stderr)
+          print(f"enabled android abis: {android_count}", file=sys.stderr)
+          print(f"selected targets: {targets}", file=sys.stderr)
+
+          print(json.dumps({
+              "build_matrix": job_matrix(desktop, {"platform": "none", "arch": "none", "runner": "ubuntu-latest"}),
+              "desktop_plan": {"include": desktop},
+              "build_count": desktop_count,
+              "android_matrix": job_matrix(android, {"platform": "android", "arch": "none", "abi": "none", "runner": "ubuntu-latest"}),
+              "android_plan": {"include": android},
+              "android_count": android_count,
+              "selected_targets": targets,
+          }, separators=(",", ":")))
           PY
           )"
-          COUNT="$(python3 -c 'import json,sys; print(sum(1 for x in json.loads(sys.argv[1])["include"] if x.get("enabled")))' "$MATRIX")"
-          ANDROID_COUNT="$(python3 -c 'import json,sys; print(sum(1 for x in json.loads(sys.argv[1])["include"] if x.get("enabled")))' "$ANDROID_MATRIX")"
-          if [[ "$PUBLISH_RELEASE" == "true" && "$COUNT" -ne 5 ]]; then
-            echo "error: publishing/updating the GitHub Release requires all 5 desktop platforms enabled (currently $COUNT);" >&2
-            echo "       Android-only / partial builds must set publish_release=false" >&2
-            exit 1
-          fi
-          TARGETS="$(python3 -c '
-          import json,sys
-          out = []
-          for raw in sys.argv[1:]:
-              for x in json.loads(raw)["include"]:
-                  if x.get("enabled"):
-                      out.append(x["platform"] + "-" + x.get("abi", x["arch"]))
-          print(", ".join(out))
-          ' "$MATRIX" "$ANDROID_MATRIX")"
+          # 一次性把 PLAN 摊成 GITHUB_OUTPUT 的 key=value（dict/list 走紧凑 JSON）。
+          python3 - "$PLAN" <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import sys
+
+          plan = json.loads(sys.argv[1])
+          for key, value in plan.items():
+              text = json.dumps(value, separators=(",", ":")) if isinstance(value, (dict, list)) else value
+              print(f"{key}={text}")
+          PY
           {
             echo "tdlib_version=$VERSION"
             echo "tdlib_commit=$COMMIT"
-            echo "build_matrix=$MATRIX"
-            echo "build_count=$COUNT"
-            echo "android_matrix=$ANDROID_MATRIX"
-            echo "android_count=$ANDROID_COUNT"
-            echo "selected_targets=$TARGETS"
           } >> "$GITHUB_OUTPUT"
           echo "using version=$VERSION commit=$COMMIT release_tag=$TAG"
-          echo "enabled desktop platforms: $COUNT / 5"
-          echo "enabled android abis: $ANDROID_COUNT"
-          echo "selected targets: $TARGETS"
 
   export-schema:
     name: Export td_api.tl
@@ -208,8 +239,9 @@ jobs:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
     needs: resolve-tdlib
     # 暂时只建 Android：桌面五项在 resolve 的 `desktop` 表里都是 `enabled: false`，
-    # 于是这里整批 skip（不是从矩阵里删掉，release_assets.rs 的比对照旧有效）。
-    if: matrix.enabled
+    # 于是 build_count=0，这里整批 skip（不是从矩阵里删掉，release_assets.rs 的比对照旧有效）。
+    # ⚠️ 只能看 `needs`：job 级 `if` 里没有 `matrix` 上下文（GitHub 在展开矩阵前就求值）。
+    if: needs.resolve-tdlib.outputs.build_count != '0'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -432,7 +464,8 @@ jobs:
   build-android:
     name: android-${{ matrix.abi }}
     needs: resolve-tdlib
-    if: matrix.enabled
+    # ⚠️ 不能在 job 级 `if` 里用 `matrix`（GitHub 会在展开矩阵前求值 → Invalid workflow file）
+    if: needs.resolve-tdlib.outputs.android_count != '0'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     strategy:
@@ -564,7 +597,8 @@ jobs:
   build-framework-android:
     name: fuyubot-${{ matrix.arch }}
     needs: [resolve-tdlib, build-android]
-    if: matrix.enabled && needs.build-android.result == 'success'
+    # 同上：只用 `needs`（`build-android` 被 skip 时这里也自然 skip）
+    if: needs.build-android.result == 'success'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -847,8 +881,10 @@ jobs:
         env:
           VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
           COMMIT: ${{ needs.resolve-tdlib.outputs.tdlib_commit }}
-          BUILD_MATRIX: ${{ needs.resolve-tdlib.outputs.build_matrix }}
-          ANDROID_MATRIX: ${{ needs.resolve-tdlib.outputs.android_matrix }}
+          # 摘要用**完整计划**（含未启用的行，好看出「哪些暂时关了」），
+          # 而 job 用的是只含启用行的 build_matrix / android_matrix。
+          DESKTOP_PLAN: ${{ needs.resolve-tdlib.outputs.desktop_plan }}
+          ANDROID_PLAN: ${{ needs.resolve-tdlib.outputs.android_plan }}
           BUILD: ${{ needs.build.result }}
           ANDROID_BUILD: ${{ needs.build-android.result }}
           FRAMEWORK_BUILD: ${{ needs.build-framework-android.result }}
@@ -888,9 +924,9 @@ jobs:
             echo "| Platform | Arch | Runner | Asset | Enabled |"
             echo "|----------|------|--------|-------|---------|"
           } >> "$GITHUB_STEP_SUMMARY"
-          # 从 matrix 现算，不手抄：手抄过一次，arm64 那行写的是 windows-latest，
+          # 从计划现算，不手抄：手抄过一次，arm64 那行写的是 windows-latest，
           # 而 matrix 里其实是另一个 label——两边直接对不上。
-          python3 - "$BUILD_MATRIX" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$DESKTOP_PLAN" <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json, sys
           matrix = json.loads(sys.argv[1])
           for item in matrix["include"]:
@@ -902,7 +938,7 @@ jobs:
           print("| ABI | Arch | Runner | Artifact | Enabled |")
           print("|-----|------|--------|----------|---------|")
           PY
-          python3 - "$ANDROID_MATRIX" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$ANDROID_PLAN" <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json, sys
           matrix = json.loads(sys.argv[1])
           for item in matrix["include"]:

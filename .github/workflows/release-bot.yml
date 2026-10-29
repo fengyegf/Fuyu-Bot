@@ -45,54 +45,58 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ⚠️ 为什么要有 plan：job 级 `if` **拿不到 `matrix` 上下文**（GitHub 在展开矩阵之前就求值，
+  #    写 `if: matrix.enabled` 会直接
+  #    `Invalid workflow file ... Unrecognized named-value: 'matrix'`）。
+  #    所以这里先算出一份「只有启用行」的矩阵输出，真正的门禁看 `needs.plan.outputs.count`。
+  #    矩阵本身不能为空 → 一个都没启用时塞一行占位（job 已被 count 挡掉，不会真跑）。
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      plan: ${{ steps.plan.outputs.plan }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - name: Compute the enabled platform matrix
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+
+          # ⚠️ 暂时只做 Android：下面五行都是 `enabled: False` → 这批 job 全 skip
+          #    （`publish` 随之 skip，不会发出半套 zip）。恢复 = 把 `enabled` 改回 True。
+          #
+          #    Android 的框架本体目前**不在这里**：这个 workflow 是从
+          #    `TDLib-v<版本>` Release 下 tdjson 的，而 Android 的 tdjson（`tdjson-android-<abi>`）
+          #    还只是 `build-tdlib.yml` 的 workflow artifact、没进 Release。
+          #    等它进了 Release，再加一行 android（tdlib 写 `TDLib-android-<arch>`）。
+          platforms = [
+              {"os": "windows-latest", "asset": "fuyubot-windows-x86_64", "tdlib": "TDLib-windows-x86_64", "platform_dir": "windows-x86_64", "bin": "fuyubot.exe", "enabled": False},
+              # runner 标签与 build-tdlib.yml 的 matrix 保持一致（那边产的就是 ARM64 资产）
+              {"os": "windows-11-vs2026-arm", "asset": "fuyubot-windows-aarch64", "tdlib": "TDLib-windows-aarch64", "platform_dir": "windows-aarch64", "bin": "fuyubot.exe", "enabled": False},
+              {"os": "ubuntu-latest", "asset": "fuyubot-linux-x86_64", "tdlib": "TDLib-linux-x86_64", "platform_dir": "linux-x86_64", "bin": "fuyubot", "enabled": False},
+              {"os": "ubuntu-24.04-arm", "asset": "fuyubot-linux-aarch64", "tdlib": "TDLib-linux-aarch64", "platform_dir": "linux-aarch64", "bin": "fuyubot", "enabled": False},
+              # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
+              {"os": "macos-14", "asset": "fuyubot-macos-aarch64", "tdlib": "TDLib-macos-aarch64", "platform_dir": "macos-aarch64", "bin": "fuyubot", "enabled": False},
+          ]
+          enabled = [row for row in platforms if row.get("enabled")]
+          placeholder = {"os": "ubuntu-latest", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "platform_dir": "none-none", "bin": "fuyubot"}
+
+          print("matrix=" + json.dumps({"include": enabled or [placeholder]}, separators=(",", ":")))
+          print("plan=" + json.dumps({"include": platforms}, separators=(",", ":")))
+          print("count=" + str(len(enabled)))
+          PY
+
   build:
     name: package ${{ matrix.asset }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
     runs-on: ${{ matrix.os }}
-    # ⚠️ 暂时只做 Android：桌面五个平台在下面的 include 里都是 `enabled: false`，
-    #    于是这批 job 全部 skip（`publish` 随之 skip，不会发出半套 zip）。
-    #    恢复某个平台 = 把它那行 `enabled` 改回 `true`。
-    #
-    #    Android 的框架本体目前**不在这里**：这个 workflow 是从
-    #    `TDLib-v<版本>` Release 下 tdjson 的，而 Android 的 tdjson（`tdjson-android-<abi>`）
-    #    还只是 `build-tdlib.yml` 的 workflow artifact、没进 Release。
-    #    等它进了 Release，再往下面的 include 里加 android 行（tdlib 写 `TDLib-android-<arch>`）。
-    if: matrix.enabled
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            asset: fuyubot-windows-x86_64
-            tdlib: TDLib-windows-x86_64
-            platform_dir: windows-x86_64
-            bin: fuyubot.exe
-            enabled: false
-          # runner 标签与 build-tdlib.yml 的 matrix 保持一致（那边产的就是 ARM64 资产）
-          - os: windows-11-vs2026-arm
-            asset: fuyubot-windows-aarch64
-            tdlib: TDLib-windows-aarch64
-            platform_dir: windows-aarch64
-            bin: fuyubot.exe
-            enabled: false
-          - os: ubuntu-latest
-            asset: fuyubot-linux-x86_64
-            tdlib: TDLib-linux-x86_64
-            platform_dir: linux-x86_64
-            bin: fuyubot
-            enabled: false
-          - os: ubuntu-24.04-arm
-            asset: fuyubot-linux-aarch64
-            tdlib: TDLib-linux-aarch64
-            platform_dir: linux-aarch64
-            bin: fuyubot
-            enabled: false
-          # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
-          - os: macos-14
-            asset: fuyubot-macos-aarch64
-            tdlib: TDLib-macos-aarch64
-            platform_dir: macos-aarch64
-            bin: fuyubot
-            enabled: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
