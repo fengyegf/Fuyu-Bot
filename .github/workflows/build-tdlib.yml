@@ -3,6 +3,21 @@ name: Build TDLib
 # Build follows https://tdlib.github.io/td/build.html (official CMake + tdjson).
 # Extra on top: OpenSSL/zlib statically merged into tdjson (static flags / triplets).
 #
+# ⚠️ 职责边界：**这个 workflow 只产 TDLib（tdjson 动态库）**，不编 `fuyubot` 本体。
+#    `fuyubot` 二进制 / 内置插件 / zip / Release 全在 `release-bot.yml`（含 Android）。
+#    这边跑完把产物交出去就结束了。
+#
+# 两种产物：
+#   - 桌面：`TDLib-<os>-<arch>`，是 **loader 的发布资产**（tag `TDLib-v<版本>`），走 `assemble` + Release。
+#   - Android：`tdjson-android-<abi>`，**不是** loader 资产（loader 只认 windows/macos/linux），
+#     作为 workflow artifact 交给 `release-bot.yml` 的 `build-android`
+#     （先看 Release 上的 `TDLib-android-<arch>`，没有就退回这里最近一次成功的 artifact）。
+#
+# `desktop` 表里每行都有 `enabled` 开关，**默认全为 `true`**（行为与以前一致）；
+# 只想建某几个平台时，把其余行改成 `false` 即可。**别删行**——
+# `crates/fuyubot-tdlib/tests/release_assets.rs` 会读这张表逐行比对 loader 的 `ASSET_*`。
+# 一个都没启用时会塞一行 `platform: none` 的占位（矩阵不能为空），job 由 `build_count` 挡掉。
+#
 # Windows / vcpkg PITFALL:
 #   Use the runner's preinstalled vcpkg as-is (latest).
 #   NEVER switch / pin / checkout a vcpkg branch or commit.
@@ -19,7 +34,7 @@ on:
         required: true
         type: string
       publish_release:
-        description: "Publish/update the GitHub Release (all 5 platforms are always built; turn off to only run the build)"
+        description: "Publish/update the GitHub Release (requires all 5 desktop platforms enabled; turn OFF for Android-only builds)"
         required: true
         type: boolean
         default: true
@@ -48,7 +63,11 @@ jobs:
       tdlib_version: ${{ steps.meta.outputs.tdlib_version }}
       tdlib_commit: ${{ steps.meta.outputs.tdlib_commit }}
       build_matrix: ${{ steps.meta.outputs.build_matrix }}
+      desktop_plan: ${{ steps.meta.outputs.desktop_plan }}
       build_count: ${{ steps.meta.outputs.build_count }}
+      desktop_count: ${{ steps.meta.outputs.desktop_count }}
+      android_plan: ${{ steps.meta.outputs.android_plan }}
+      android_count: ${{ steps.meta.outputs.android_count }}
       selected_targets: ${{ steps.meta.outputs.selected_targets }}
     steps:
       - name: Validate version and use supplied TDLib commit SHA
@@ -79,33 +98,89 @@ jobs:
           #    命名约定：`TDLib-<os>-<arch>`，其中 arch 用 cargo 口径（`aarch64`，不是 `arm64`）。
           #    注意矩阵里的 `arch` 是 CI 自己的口径（runner/打包/校验用），**不参与**资产名。
           #    crates/fuyubot-tdlib/tests/release_assets.rs 会读本文件逐行比对，漂了就红。
-          MATRIX="$(python3 - <<'PY'
+          #
+          # 每行都有 `enabled` 开关（默认全 `true`）：只想建某几个平台时把其余行改 `false`。
+          # 停用项仍然留在矩阵里（不是注释掉），这样 release_assets.rs 的双向比对照样成立；
+          # ⚠️ **job 级 `if` 拿不到 `matrix` 上下文**：GitHub 在展开矩阵**之前**就求这个
+          #    表达式，`if: matrix.enabled` 会直接
+          #    `Invalid workflow file ... Unrecognized named-value: 'matrix'`。
+          #    所以「建不建」由 `needs.resolve-tdlib.outputs.<count> != '0'` 决定（见各 job），
+          #    这里的矩阵只输出**启用**的行。
+          # ⚠️ 矩阵还不能为空（`fromJSON` 出来空 include，job 直接报错），所以「一个都没启用」
+          #    时塞一行 `platform: none` 占位——它永远不会真的跑，job 已经被 count 挡掉了。
+          # 发布 Release 要求五个桌面平台全 `true`（见下面的 publish 门禁）。
+          PLAN="$(python3 - <<'PY'
           import json
-          include = [
-              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-linux-x86_64"},
-              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-linux-aarch64"},
-              {"platform": "macos", "arch": "arm64", "runner": "macos-14", "asset": "TDLib-macos-aarch64"},
-              {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64"},
-              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-aarch64"},
+          import os
+          import sys
+
+          desktop = [
+              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-linux-x86_64", "enabled": True},
+              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-linux-aarch64", "enabled": True},
+              {"platform": "macos", "arch": "arm64", "runner": "macos-14", "asset": "TDLib-macos-aarch64", "enabled": True},
+              {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64", "enabled": True},
+              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-aarch64", "enabled": True},
           ]
-          print(json.dumps({"include": include}, separators=(",", ":")))
+          # Android：**不是** loader 的发布资产（loader 只认 windows/macos/linux），
+          # 所以键名叫 `artifact` 而不是 `asset`——资产名故意不带 `TDLib-` 前缀，
+          # 不进 Release、不参与 SHA256SUMS，只作为 workflow artifact 上传。
+          # `arch` 仍是 cargo 口径（aarch64 / x86_64），`abi` 是 NDK 的 ABI 名。
+          android = [
+              {"platform": "android", "arch": "aarch64", "abi": "arm64-v8a", "target": "aarch64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-arm64-v8a", "enabled": True},
+              {"platform": "android", "arch": "x86_64", "abi": "x86_64", "target": "x86_64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-x86_64", "enabled": True},
+          ]
+
+          def enabled(rows):
+              return [row for row in rows if row.get("enabled")]
+
+          desktop_count = len(enabled(desktop))
+          android_count = len(enabled(android))
+          publish = os.environ.get("PUBLISH_RELEASE", "false")
+
+          if publish == "true" and desktop_count != 5:
+              print(
+                  "error: publishing/updating the GitHub Release requires all 5 desktop platforms "
+                  f"enabled (currently {desktop_count});",
+                  file=sys.stderr,
+              )
+              print("       Android-only / partial builds must set publish_release=false", file=sys.stderr)
+              sys.exit(1)
+
+          # 一个矩阵装下所有平台：Android 只是多几条 `if: matrix.platform == 'android'` 的
+          # 步骤（交叉编译），其余步骤与桌面共用，UI 里就只有一个 "Matrix: build"。
+          rows = enabled(desktop) + enabled(android)
+          targets = ", ".join(row["platform"] + "-" + row.get("abi", row["arch"]) for row in rows)
+
+          # 人看的日志走 stderr（stdout 是给下面那段解析的 JSON）
+          print(f"enabled platforms: {len(rows)}（desktop {desktop_count} / android {android_count}）", file=sys.stderr)
+          print(f"selected targets: {targets}", file=sys.stderr)
+
+          print(json.dumps({
+              "build_matrix": {"include": rows or [{"platform": "none", "arch": "none", "runner": "ubuntu-latest"}]},
+              "desktop_plan": {"include": desktop},
+              "android_plan": {"include": android},
+              "build_count": len(rows),
+              "desktop_count": desktop_count,
+              "android_count": android_count,
+              "selected_targets": targets,
+          }, separators=(",", ":")))
           PY
           )"
-          COUNT="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$MATRIX")"
-          if [[ "$PUBLISH_RELEASE" == "true" && "$COUNT" -ne 5 ]]; then
-            echo "error: publishing/updating the GitHub Release requires all 5 platform builds; turn off publish_release for a partial/test build" >&2
-            exit 1
-          fi
-          TARGETS="$(python3 -c 'import json,sys; print(", ".join(x["platform"] + "-" + x["arch"] for x in json.loads(sys.argv[1])["include"]))' "$MATRIX")"
+          # 一次性把 PLAN 摊成 GITHUB_OUTPUT 的 key=value（dict/list 走紧凑 JSON）。
+          python3 - "$PLAN" <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import sys
+
+          plan = json.loads(sys.argv[1])
+          for key, value in plan.items():
+              text = json.dumps(value, separators=(",", ":")) if isinstance(value, (dict, list)) else value
+              print(f"{key}={text}")
+          PY
           {
             echo "tdlib_version=$VERSION"
             echo "tdlib_commit=$COMMIT"
-            echo "build_matrix=$MATRIX"
-            echo "build_count=$COUNT"
-            echo "selected_targets=$TARGETS"
           } >> "$GITHUB_OUTPUT"
           echo "using version=$VERSION commit=$COMMIT release_tag=$TAG"
-          echo "selected targets: $TARGETS"
 
   export-schema:
     name: Export td_api.tl
@@ -164,11 +239,20 @@ jobs:
   build:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
     needs: resolve-tdlib
+    # 一个平台都没启用时 build_count=0，这里整批 skip
+    # （不是从矩阵里删掉，release_assets.rs 的比对照旧有效）。
+    # ⚠️ 只能看 `needs`：job 级 `if` 里没有 `matrix` 上下文（GitHub 在展开矩阵前就求值）。
+    if: needs.resolve-tdlib.outputs.build_count != '0'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    # Android 的交叉编译（host 生成 + 串行 OpenSSL + TDLib）比桌面慢，留足余量。
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve-tdlib.outputs.build_matrix) }}
+    env:
+      # 只有 android 行会读这两个；桌面行里没人用。
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      ANDROID_API_LEVEL: "21"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -204,6 +288,43 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: chmod +x .github/scripts/*.sh
+
+      # ---------------- Android（交叉编译，只需要 Linux runner）----------------
+      - name: Install Android host dependencies
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # gperf + g++ 是为了**host 侧生成源码**：交叉编译时 `prepare_cross_compiling`
+          # 目标不存在（CMakeLists 里被 `if (NOT CMAKE_CROSSCOMPILING)` 包着），
+          # 而 `td/generate/auto/**` 不入库，必须先让主机把它跑出来。
+          # `perl` 是 OpenSSL 的 `./Configure` 硬依赖（runner 镜像自带，但缺了报错很难懂）；
+          # `make` 是 `cmake --build`（Unix Makefiles）要用的。
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            gperf g++ make perl cmake ninja-build ca-certificates curl
+
+      - name: Install Android NDK
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          NDK="$SDK/ndk/$ANDROID_NDK_VERSION"
+          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null || true
+          fi
+          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+            echo "error: NDK $ANDROID_NDK_VERSION 没装上（$NDK）" >&2
+            ls -la "$SDK/ndk" >&2 || true
+            exit 1
+          fi
+          {
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_NDK_ROOT=$NDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+          } >> "$GITHUB_ENV"
+          echo "==> NDK $(sed -n 's/^Pkg\.Revision *= *//p' "$NDK/source.properties")"
 
       # ---------------- Linux ----------------
       - name: Build TDLib (Linux)
@@ -371,13 +492,72 @@ jobs:
           .github/scripts/verify-tdlib.sh \
             "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             windows "$ARCH" "${{ matrix.asset }}"
+
+      # ---------------- Android ----------------
+      # 产物是 `tdjson-android-<abi>`（**不是** loader 的发布资产：loader 只认
+      # windows/macos/linux），只作为 workflow artifact 交给 release-bot 的 Android 构建。
+      - name: Build TDLib tdjson (Android)
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out dist
+          # 脚本内部：host 生成源码 → 静态 OpenSSL(NDK) → cmake(android.toolchain.cmake) → tdjson
+          .github/scripts/build-tdlib-android.sh \
+            "$GITHUB_WORKSPACE/td-src" \
+            "$GITHUB_WORKSPACE/out" \
+            "${{ matrix.abi }}"
+
+      - name: Package TDLib (Android)
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve-tdlib.outputs.tdlib_version }}"
+          # 用 `matrix.artifact`（不是 `matrix.asset`）：Android 不是 loader 资产，
+          # 这样 release_assets.rs 的双向比对也不会把它算进去。
+          .github/scripts/package-tdlib.sh \
+            "$GITHUB_WORKSPACE/out/tdjson" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}" \
+            android \
+            "${{ matrix.arch }}" \
+            "$VERSION" \
+            "$TDLIB_COMMIT" \
+            "${{ matrix.artifact }}"
+
+      - name: Verify TDLib (Android)
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/scripts/verify-tdlib.sh \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}" \
+            android \
+            "${{ matrix.arch }}" \
+            "${{ matrix.artifact }}"
+
       - name: Upload TDLib artifact
+        if: matrix.platform != 'android'
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-${{ needs.resolve-tdlib.outputs.tdlib_version }}-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload TDLib artifact (Android)
+        if: matrix.platform == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-${{ needs.resolve-tdlib.outputs.tdlib_version }}-android-${{ matrix.abi }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ⚠️ 框架本体（含 Android 可执行文件）**不在这里**：本 workflow 只负责产 TDLib
+  #    （`TDLib-*` 给 loader，`tdjson-android-<abi>` 给 Android 框架构建用）。
+  #    `fuyubot` 二进制的构建全部在 `release-bot.yml`（那边才有"产品"的概念：
+  #    版本号、plugins/、zip、Release）。Android 的框架 job 也在那边。
 
   assemble:
     name: Assemble release bundle
@@ -419,7 +599,9 @@ jobs:
           ls -lah dist
           COUNT="$(find dist -type f -name 'TDLib-*' | wc -l)"
           echo "==> found $COUNT package(s)"
-          EXPECTED="${{ needs.resolve-tdlib.outputs.build_count }}"
+          # 只数**桌面**包：`build_count` 现在是「桌面 + Android」的总数，
+          # 而 Android 的产物不叫 TDLib-*、也不进 Release。
+          EXPECTED="${{ needs.resolve-tdlib.outputs.desktop_count }}"
           if [[ "$COUNT" -lt "$EXPECTED" ]]; then
             echo "error: expected $EXPECTED selected platform packages, found $COUNT" >&2
             find artifacts -type f >&2 || true
@@ -449,7 +631,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
           COMMIT: ${{ needs.resolve-tdlib.outputs.tdlib_commit }}
-          BUILD_MATRIX: ${{ needs.resolve-tdlib.outputs.build_matrix }}
+          # 发布说明里的表只列桌面（Android 的 tdjson 不进 Release，也不是 loader 资产）
+          DESKTOP_PLAN: ${{ needs.resolve-tdlib.outputs.desktop_plan }}
         shell: bash
         run: |
           set -euo pipefail
@@ -478,7 +661,7 @@ jobs:
             echo
             echo "| Platform | Arch | Archive | Directory inside archive | Dynamic library |"
             echo "|----------|------|---------|--------------------------|-----------------|"
-            python3 - "$BUILD_MATRIX" <<'PY' >> "$NOTES"
+            python3 - "$DESKTOP_PLAN" <<'PY' >> "$NOTES"
           import json, sys
           matrix = json.loads(sys.argv[1])
           libraries = {"linux": "libtdjson.so", "macos": "libtdjson.dylib", "windows": "tdjson.dll"}
@@ -559,7 +742,10 @@ jobs:
         env:
           VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
           COMMIT: ${{ needs.resolve-tdlib.outputs.tdlib_commit }}
-          BUILD_MATRIX: ${{ needs.resolve-tdlib.outputs.build_matrix }}
+          # 摘要用**完整计划**（含未启用的行，好看出「哪些暂时关了」），
+          # 而 job 用的是只含启用行的 build_matrix。
+          DESKTOP_PLAN: ${{ needs.resolve-tdlib.outputs.desktop_plan }}
+          ANDROID_PLAN: ${{ needs.resolve-tdlib.outputs.android_plan }}
           BUILD: ${{ needs.build.result }}
           ASSEMBLE: ${{ needs.assemble.result }}
           SCHEMA: ${{ needs.export-schema.result }}
@@ -581,21 +767,38 @@ jobs:
             echo "| Publish | \`${PUBLISH}\` |"
             echo "| Selected targets | \`${TARGETS}\` |"
             echo "| Schema export | \`${SCHEMA}\` |"
-            echo "| Matrix builds | \`${BUILD}\` |"
+            echo "| Matrix builds（含 Android） | \`${BUILD}\` |"
             echo "| Assemble | \`${ASSEMBLE}\` |"
             echo
             echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages + \`SHA256SUMS\`."
             echo
-            echo "### Matrix"
+            echo "本 workflow **只产 TDLib**：桌面 \`TDLib-*\`（loader 的发布资产）与 \`tdjson-android-<abi>\`"
+            echo "（Android 用，只是 workflow artifact）。\`fuyubot\` 二进制与 \`plugins/\` 的构建在 \`release-bot.yml\`。"
+            echo "loader 的 \`ASSETS\` 表仍只覆盖 windows / macos / linux。"
             echo
-            echo "| Platform | Arch | Runner | Asset |"
-            echo "|----------|------|--------|-------|"
+            echo "### Desktop matrix"
+            echo
+            echo "| Platform | Arch | Runner | Asset | Enabled |"
+            echo "|----------|------|--------|-------|---------|"
           } >> "$GITHUB_STEP_SUMMARY"
-          # 从 matrix 现算，不手抄：手抄过一次，arm64 那行写的是 windows-latest，
+          # 从计划现算，不手抄：手抄过一次，arm64 那行写的是 windows-latest，
           # 而 matrix 里其实是另一个 label——两边直接对不上。
-          python3 - "$BUILD_MATRIX" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$DESKTOP_PLAN" <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json, sys
           matrix = json.loads(sys.argv[1])
           for item in matrix["include"]:
-              print(f"| {item['platform']} | {item['arch']} | {item['runner']} | `{item['asset']}` |")
+              enabled = "yes" if item.get("enabled", True) else "**no** (temporarily off)"
+              print(f"| {item['platform']} | {item['arch']} | {item['runner']} | `{item['asset']}` | {enabled} |")
+          print()
+          print("### Android matrix")
+          print()
+          print("| ABI | Arch | Runner | Artifact | Enabled |")
+          print("|-----|------|--------|----------|---------|")
+          PY
+          python3 - "$ANDROID_PLAN" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          matrix = json.loads(sys.argv[1])
+          for item in matrix["include"]:
+              enabled = "yes" if item.get("enabled", True) else "no"
+              print(f"| `{item['abi']}` | {item['arch']} | {item['runner']} | `{item['artifact']}` | {enabled} |")
           PY

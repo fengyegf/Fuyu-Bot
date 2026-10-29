@@ -9,9 +9,14 @@
 # 本仓库只发**运行时**。插件开发 CLI（`fuyubot-sdk`）在 FuyuBot-SDK 仓库的
 # `release-sdk.yml` 里发；文档站在 FuyuBot-Docs。
 #
-# 平台集合 = `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 `ASSETS` 表：
+# 桌面平台集合 = `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 `ASSETS` 表：
 #   Windows x86_64 / aarch64、Linux x86_64 / aarch64、macOS **只有 aarch64**
 #   （Intel Mac 没有 runner，见 ASSETS 的注释）。
+#
+# **Android** 是额外的一条线（`build-android` job）：交叉编译出**可执行文件**
+#   （`aarch64-linux-android` / `x86_64-linux-android` 的 ELF，不是 apk），
+#   包结构与桌面一致（`fuyubot` + 同级 `libtdjson.so` + `plugins/`），
+#   只是 tdjson 需要应用期交叉编译，而 loader 的 `ASSETS` 表不含 android。
 #
 # 用户视角（`README.md` 与文档站的「使用」就是这么写的）：
 #   下载 `fuyubot-<版本>-<OS>-<平台>.zip` → 解压 → `./fuyubot init` / `./fuyubot run`。
@@ -24,8 +29,16 @@
 # zip 只在 publish（Linux）里生成——Windows runner 的 bash 没有 zip 命令，
 # 别为它分叉。
 #
-# 与 `build-tdlib.yml` 分工：那边产 TDLib 动态库（`TDLib-v<版本>` tag），
-# 这边只消费它，**不重新编 TDLib**。所以这里要等对应版本的 TDLib Release 已经存在。
+# 与 `build-tdlib.yml` 分工：那边**只产 TDLib**（桌面 `TDLib-*` 发布资产 + Android 的
+# `tdjson-android-<abi>`），这边**只产 fuyubot 本体**（含 Android 可执行文件），
+# 不重新编 TDLib。所以这里要等对应版本的 TDLib 产物已经存在：
+#   - 桌面：从 `TDLib-v<版本>` Release 下 `TDLib-<os>-<arch>`；
+#   - Android：同样先看 Release 上的 `TDLib-android-<arch>`；**没有**就退回最近一次
+#     成功的 `build-tdlib` 运行的 artifact（现在 Android 的 tdjson 还没进 Release——
+#     发布门禁要求全平台启用）。等它进了 Release，这条退回分支自然不再走。
+#
+# 桌面平台每行都有 `enabled` 开关（**默认全 `True`**，行为与以前一致）：
+# 只想产某几个平台时把其余行改 `False` 即可，矩阵不能为空（空时塞一行占位）。
 name: release bot
 
 on:
@@ -35,46 +48,82 @@ on:
 
 permissions:
   contents: write
+  # Android 的 tdjson 可能要从「最近一次成功的 build-tdlib 运行」的 artifact 里取，
+  # `gh run list/download` 需要 actions:read。
+  actions: read
 
 env:
-  TDLIB_VERSION: '1.8.68'
+  # ⚠️ 必须与 `crates/fuyubot-tdlib/Cargo.toml` 的 `[package.metadata.fuyubot] tdlib-version`
+  #    一致（也等于 `build-tdlib.yml` 里填的 tdlib_version）：Release tag 与 `.tdlib-cache`
+  #    的目录名都按它拼，填错就是 404 / 找不到缓存。
+  TDLIB_VERSION: '1.8.69'
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ⚠️ 为什么要有 plan：job 级 `if` **拿不到 `matrix` 上下文**（GitHub 在展开矩阵之前就求值，
+  #    写 `if: matrix.enabled` 会直接
+  #    `Invalid workflow file ... Unrecognized named-value: 'matrix'`）。
+  #    所以这里先算出一份「只有启用行」的矩阵输出，真正的门禁看 `needs.plan.outputs.count`。
+  #    矩阵本身不能为空 → 一个都没启用时塞一行占位（job 已被 count 挡掉，不会真跑）。
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      plan: ${{ steps.plan.outputs.plan }}
+      count: ${{ steps.plan.outputs.count }}
+      android_matrix: ${{ steps.plan.outputs.android_matrix }}
+      android_plan: ${{ steps.plan.outputs.android_plan }}
+      android_count: ${{ steps.plan.outputs.android_count }}
+    steps:
+      - name: Compute the enabled platform matrices
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+
+          # 桌面每行都有 `enabled` 开关（默认全 True）：只想产某几个平台时把其余行改 False。
+          platforms = [
+              {"os": "windows-latest", "asset": "fuyubot-windows-x86_64", "tdlib": "TDLib-windows-x86_64", "platform_dir": "windows-x86_64", "bin": "fuyubot.exe", "enabled": True},
+              # runner 标签与 build-tdlib.yml 的 matrix 保持一致（那边产的就是 ARM64 资产）
+              {"os": "windows-11-vs2026-arm", "asset": "fuyubot-windows-aarch64", "tdlib": "TDLib-windows-aarch64", "platform_dir": "windows-aarch64", "bin": "fuyubot.exe", "enabled": True},
+              {"os": "ubuntu-latest", "asset": "fuyubot-linux-x86_64", "tdlib": "TDLib-linux-x86_64", "platform_dir": "linux-x86_64", "bin": "fuyubot", "enabled": True},
+              {"os": "ubuntu-24.04-arm", "asset": "fuyubot-linux-aarch64", "tdlib": "TDLib-linux-aarch64", "platform_dir": "linux-aarch64", "bin": "fuyubot", "enabled": True},
+              # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
+              {"os": "macos-14", "asset": "fuyubot-macos-aarch64", "tdlib": "TDLib-macos-aarch64", "platform_dir": "macos-aarch64", "bin": "fuyubot", "enabled": True},
+          ]
+          # Android：**交叉编译**，不在上面那张表里（那张表的 `tdlib` 都是从 Release 下的
+          # `TDLib-<os>-<arch>`）。这边的 `tdlib` 先试 Release 上的 `TDLib-android-<arch>`，
+          # 没有就退回最近一次成功 build-tdlib 的 artifact `tdlib-<版本>-android-<abi>`。
+          android = [
+              {"os": "ubuntu-22.04", "asset": "fuyubot-android-aarch64", "tdlib": "TDLib-android-aarch64", "abi": "arm64-v8a", "arch": "aarch64", "target": "aarch64-linux-android", "bin": "fuyubot", "enabled": True},
+              {"os": "ubuntu-22.04", "asset": "fuyubot-android-x86_64", "tdlib": "TDLib-android-x86_64", "abi": "x86_64", "arch": "x86_64", "target": "x86_64-linux-android", "bin": "fuyubot", "enabled": True},
+          ]
+
+          def pack(rows, placeholder):
+              rows = [row for row in rows if row.get("enabled")]
+              return {"include": rows or [placeholder]}
+
+          desktop_placeholder = {"os": "ubuntu-latest", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "platform_dir": "none-none", "bin": "fuyubot"}
+          android_placeholder = {"os": "ubuntu-22.04", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "abi": "none", "arch": "none", "target": "aarch64-linux-android", "bin": "fuyubot"}
+
+          print("matrix=" + json.dumps(pack(platforms, desktop_placeholder), separators=(",", ":")))
+          print("plan=" + json.dumps({"include": platforms}, separators=(",", ":")))
+          print("count=" + str(len([row for row in platforms if row.get("enabled")])))
+          print("android_matrix=" + json.dumps(pack(android, android_placeholder), separators=(",", ":")))
+          print("android_plan=" + json.dumps({"include": android}, separators=(",", ":")))
+          print("android_count=" + str(len([row for row in android if row.get("enabled")])))
+          PY
+
   build:
     name: package ${{ matrix.asset }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            asset: fuyubot-windows-x86_64
-            tdlib: TDLib-windows-x86_64
-            platform_dir: windows-x86_64
-            bin: fuyubot.exe
-          # runner 标签与 build-tdlib.yml 的 matrix 保持一致（那边产的就是 ARM64 资产）
-          - os: windows-11-vs2026-arm
-            asset: fuyubot-windows-aarch64
-            tdlib: TDLib-windows-aarch64
-            platform_dir: windows-aarch64
-            bin: fuyubot.exe
-          - os: ubuntu-latest
-            asset: fuyubot-linux-x86_64
-            tdlib: TDLib-linux-x86_64
-            platform_dir: linux-x86_64
-            bin: fuyubot
-          - os: ubuntu-24.04-arm
-            asset: fuyubot-linux-aarch64
-            tdlib: TDLib-linux-aarch64
-            platform_dir: linux-aarch64
-            bin: fuyubot
-          # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
-          - os: macos-14
-            asset: fuyubot-macos-aarch64
-            tdlib: TDLib-macos-aarch64
-            platform_dir: macos-aarch64
-            bin: fuyubot
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -182,12 +231,163 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # ---------------- Android（交叉编译，可执行文件不是 apk）----------------
+  # 本 job **只编 fuyubot**，tdjson 从 `build-tdlib.yml` 的产物里拿：
+  #   1. 先看 `TDLib-v<版本>` Release 上的 `TDLib-android-<arch>`（还不是 loader 资产，
+  #      等它进 Release 后这条就命中）；
+  #   2. 没有就退回**最近一次成功的 build-tdlib 运行**的 artifact
+  #      `tdlib-<版本>-android-<abi>`（`actions:read` 权限就是给这一步的）。
+  # 拿到后按 `.tdlib-cache/<版本>/android-<arch>/` 布局铺开——`fuyubot-tdlib/build.rs`
+  # 会把库拷到可执行文件同级，loader 的优先级 2b（可执行文件目录）在设备上就能命中。
+  build-android:
+    name: ${{ matrix.asset }}
+    needs: plan
+    if: needs.plan.outputs.android_count != '0'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.android_matrix) }}
+    env:
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      ANDROID_API_LEVEL: "21"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        shell: bash
+        run: chmod +x .github/scripts/*.sh
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # 只编 Rust，但依赖树里有 C 代码（`ureq` → `ring`，按 host 编译），要有 cc/ld。
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential ca-certificates curl
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          NDK="$SDK/ndk/$ANDROID_NDK_VERSION"
+          if [[ ! -f "$NDK/build/cmake/android.toolchain.cmake" ]]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null || true
+          fi
+          {
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_NDK_ROOT=$NDK"
+          } >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 两个来源都可能失败，所以整段容错：真正的判据是下一步「必须存在 libtdjson.so」。
+      - name: "Fetch Android tdjson (Release first, else latest build-tdlib artifact)"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tarball=""
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/TDLib-v${TDLIB_VERSION}/${{ matrix.tdlib }}"
+          if curl -fsSL --retry 2 -o "$work/tdjson.tar.gz" "$url"; then
+            echo "==> 从 Release 取到 ${{ matrix.tdlib }}"
+            tarball="$work/tdjson.tar.gz"
+          else
+            echo "warning: Release 上没有 ${{ matrix.tdlib }}（$url），退回最近一次成功的 build-tdlib artifact" >&2
+            run_id="$(gh run list --workflow build-tdlib.yml --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+            if [[ -n "$run_id" ]]; then
+              echo "==> 用 run $run_id 的 artifact tdlib-${TDLIB_VERSION}-android-${{ matrix.abi }}"
+              gh run download "$run_id" \
+                --name "tdlib-${TDLIB_VERSION}-android-${{ matrix.abi }}" \
+                --dir "$work/artifact" || true
+              # ⚠️ 别按扩展名找：TDLib 资产名是 `<os>-<arch>` 口径、**不带扩展名**
+              #    （loader 那边 asset_name() 拼进 URL 的就是它），内容才是 tar.gz。
+              tarball="$(find "$work/artifact" -type f | head -n1 || true)"
+            fi
+          fi
+          if [[ -z "$tarball" || ! -f "$tarball" ]]; then
+            echo "error: 拿不到 Android 的 tdjson。先跑一次 build-tdlib（tdlib_version=${TDLIB_VERSION}）" >&2
+            exit 1
+          fi
+          dest=".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}"
+          mkdir -p "$dest" "$work/unpack"
+          tar -xzf "$tarball" -C "$work/unpack" --strip-components=1
+          cp -a "$work/unpack/." "$dest/"
+          ls -lh "$dest"
+
+      - name: Check tdjson is in place
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}/libtdjson.so"
+          [[ -f "$lib" ]] || { echo "error: 缺 $lib" >&2; exit 1; }
+          ls -lh "$lib"
+
+      - name: Build fuyubot for Android
+        shell: bash
+        env:
+          FUYUBOT_TDLIB_VENDORED_CACHE: ${{ github.workspace }}/.tdlib-cache
+        run: |
+          set -euo pipefail
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          triple="${{ matrix.target }}"
+          # cargo 的 linker 环境变量名是 `CARGO_TARGET_<TRIPLE 大写下划线>_LINKER`
+          upper="$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')"
+          linker="$toolchain/bin/${triple}${ANDROID_API_LEVEL}-clang"
+          export "CARGO_TARGET_${upper}_LINKER=$linker"
+          export "CC_${triple//-/_}=$linker"
+          export "AR_${triple//-/_}=$toolchain/bin/llvm-ar"
+          echo "==> linker: $linker"
+          cargo build --release --target "$triple" \
+            -p fuyubot-cli \
+            -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
+          ls -lh "target/$triple/release/fuyubot"
+
+      - name: Package fuyubot (Android)
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # 版本口径与桌面一致：tag 推送用 tag 名（v0.1.2），分支上手动跑用短 sha
+          if [[ "$GIT_REF" == refs/tags/* ]]; then
+            version="$GIT_REF_NAME"
+          else
+            version="dev-${GIT_SHA:0:7}"
+          fi
+          pkg="fuyubot-${version}-android-${{ matrix.arch }}"
+          # 参数顺序（见脚本头）：<triple> <arch> <tdlib版本> <tdlib commit> <dist> [tdjson目录] [包名]
+          # ⚠️ 第 6 个是 **tdjson 目录**，不是包名——少写一个就会把包名当成目录，
+          #    报「fuyubot-…-android-aarch64 里没有 libtdjson.so」。
+          .github/scripts/package-bot-android.sh \
+            "${{ matrix.target }}" "${{ matrix.arch }}" "$TDLIB_VERSION" \
+            "${GIT_SHA}" dist \
+            ".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}" \
+            "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   publish:
     name: publish release
-    needs: build
+    needs: [build, build-android]
     # 只发 tag：在分支上 `workflow_dispatch`（验证构建用）时 `ref_name` 是 `master`，
     # 照旧发版会创建 / 覆盖一个叫 master 的 Release。
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 桌面那批被 `enabled: False` 停掉时（那批 job 全 skip），只要 Android 成功就照样发，
+    # 所以不能用默认的「needs 全成功」，得显式看两个 job 的结果。
+    if: startsWith(github.ref, 'refs/tags/v') && !cancelled() && (needs.build.result == 'success' || needs.build-android.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -228,6 +428,8 @@ jobs:
                 *-linux-x86_64)    label="Linux（x86_64）" ;;
                 *-linux-aarch64)   label="Linux（ARM64）" ;;
                 *-macos-aarch64)   label="macOS（Apple Silicon）" ;;
+                *-android-aarch64) label="Android（arm64-v8a，可执行文件）" ;;
+                *-android-x86_64)  label="Android（x86_64，模拟器 / 可执行文件）" ;;
                 *)                 label="$name" ;;
               esac
               printf '| %s | `%s.zip` |\n' "$label" "$name"
