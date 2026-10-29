@@ -26,6 +26,10 @@
 #
 # 与 `build-tdlib.yml` 分工：那边产 TDLib 动态库（`TDLib-v<版本>` tag），
 # 这边只消费它，**不重新编 TDLib**。所以这里要等对应版本的 TDLib Release 已经存在。
+#
+# ⚠️ 当前状态：**桌面五个平台全部停用**（include 里 `enabled: false`），
+#    暂时只产 Android（在 `build-tdlib.yml` 的 `build-framework-android` job 里，产物是
+#    workflow artifact `fuyubot-<版本>-android-<abi>`）。这里保留矩阵是为了恢复时只改一个字段。
 name: release bot
 
 on:
@@ -44,6 +48,15 @@ jobs:
   build:
     name: package ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
+    # ⚠️ 暂时只做 Android：桌面五个平台在下面的 include 里都是 `enabled: false`，
+    #    于是这批 job 全部 skip（`publish` 随之 skip，不会发出半套 zip）。
+    #    恢复某个平台 = 把它那行 `enabled` 改回 `true`。
+    #
+    #    Android 的框架本体目前**不在这里**：这个 workflow 是从
+    #    `TDLib-v<版本>` Release 下 tdjson 的，而 Android 的 tdjson（`tdjson-android-<abi>`）
+    #    还只是 `build-tdlib.yml` 的 workflow artifact、没进 Release。
+    #    等它进了 Release，再往下面的 include 里加 android 行（tdlib 写 `TDLib-android-<arch>`）。
+    if: matrix.enabled
     strategy:
       fail-fast: false
       matrix:
@@ -53,28 +66,33 @@ jobs:
             tdlib: TDLib-windows-x86_64
             platform_dir: windows-x86_64
             bin: fuyubot.exe
+            enabled: false
           # runner 标签与 build-tdlib.yml 的 matrix 保持一致（那边产的就是 ARM64 资产）
           - os: windows-11-vs2026-arm
             asset: fuyubot-windows-aarch64
             tdlib: TDLib-windows-aarch64
             platform_dir: windows-aarch64
             bin: fuyubot.exe
+            enabled: false
           - os: ubuntu-latest
             asset: fuyubot-linux-x86_64
             tdlib: TDLib-linux-x86_64
             platform_dir: linux-x86_64
             bin: fuyubot
+            enabled: false
           - os: ubuntu-24.04-arm
             asset: fuyubot-linux-aarch64
             tdlib: TDLib-linux-aarch64
             platform_dir: linux-aarch64
             bin: fuyubot
+            enabled: false
           # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
           - os: macos-14
             asset: fuyubot-macos-aarch64
             tdlib: TDLib-macos-aarch64
             platform_dir: macos-aarch64
             bin: fuyubot
+            enabled: false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

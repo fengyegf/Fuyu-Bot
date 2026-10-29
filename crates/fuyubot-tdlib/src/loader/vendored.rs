@@ -31,6 +31,14 @@ pub const ASSET_WINDOWS_AARCH64: &str = "TDLib-windows-aarch64";
 ///
 /// 目前**故意不覆盖** `macos/x86_64`（Intel Mac）：CI 没有那个 runner，
 /// 加了表反而会在构建期变成一个含糊的 404。真要支持得先给 CI 加平台。
+///
+/// 同理**故意不覆盖** `android/*`：Android 的 tdjson 由 `.github/workflows/build-tdlib.yml`
+/// 的 `build-android` job 以 `tdjson-android-<abi>` 的形式产出（workflow artifact），
+/// 再由 `build-framework-android` job 塞进 `.tdlib-cache/<版本>/android-<arch>/` 供
+/// `build.rs` 拷到可执行文件同级——**不走 Releases 的自动下载**（那张表一旦加进来，
+/// 就等于承诺 `TDLib-android-*` 一定躺在 Release 上，而现在 Android 是临时产物）。
+/// 所以 Android **有** [`library_filename`]（加载要用），但 `asset_name` 是 `None`：
+/// 在 Android 上开 `--features vendored` 会在构建期明确报「没有对应的 Releases 资产」。
 pub const ASSETS: &[(&str, &str, &str)] = &[
     ("linux", "x86_64", ASSET_LINUX_X86_64),
     ("linux", "aarch64", ASSET_LINUX_AARCH64),
@@ -40,11 +48,15 @@ pub const ASSETS: &[(&str, &str, &str)] = &[
 ];
 
 /// 平台动态库文件名；不支持的平台返回 `None`。
+///
+/// Android 也是 ELF，库名与 Linux 一致；`std::env::consts::OS` 在 Android 上是 `"android"`
+/// （**不是** `"linux"`），所以必须单列一条——漏了它 loader 会在优先级 4 报
+/// 「未知平台 android，没有约定的库文件名」。
 pub fn library_filename(os: &str) -> Option<&'static str> {
     match os {
         "windows" => Some("tdjson.dll"),
         "macos" => Some("libtdjson.dylib"),
-        "linux" => Some("libtdjson.so"),
+        "linux" | "android" => Some("libtdjson.so"),
         _ => None,
     }
 }
@@ -285,6 +297,12 @@ mod tests {
         assert_eq!(library_filename("windows"), Some("tdjson.dll"));
         assert_eq!(library_filename("macos"), Some("libtdjson.dylib"));
         assert_eq!(library_filename("linux"), Some("libtdjson.so"));
+        // Android：库名与 Linux 相同（ELF），但 `std::env::consts::OS` 是 `"android"`，
+        // 不单列一条就会在优先级 4 变成「未知平台」。
+        assert_eq!(library_filename("android"), Some("libtdjson.so"));
+        // 而**故意没有** Releases 资产：Android 的 tdjson 由 CI 的 workflow artifact 喂给
+        // 框架构建 job（见 ASSETS 的注释），所以 `--features vendored` 在 Android 上会明确报错。
+        assert_eq!(asset_name("android", "aarch64"), None);
         assert_eq!(library_filename("freebsd"), None);
     }
 

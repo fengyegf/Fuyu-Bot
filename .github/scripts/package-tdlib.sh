@@ -135,6 +135,9 @@ ${ASSET_NAME}/
 - macOS：\`libtdjson.dylib\` 链的是静态 OpenSSL/zlib；带 \`@rpath\` id 与 ad-hoc codesign。
 - Windows：\`tdjson.dll\` 用 vcpkg **static** triplet 构建；可选的 \`tdjson.lib\` 只是导入库，
   **不是**运行时依赖。
+- Android：\`libtdjson.so\` 用 NDK 交叉编译（\`c++_static\` + 静态 OpenSSL），
+  zlib 用系统自带的 \`libz.so\`；**不是** loader 的发布资产（loader 只认 windows/macos/linux），
+  资产名因此是 \`tdjson-android-<abi>\` 而不是 \`TDLib-*\`。
 EOF
 
 # 一律 tar.gz。**不要**按扩展名分派：资产名本身不带扩展名。
