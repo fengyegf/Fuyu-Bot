@@ -1,0 +1,30 @@
+publish release	Publish	﻿2026-10-29T11:35:31.3874599Z ##[group]Run set -euo pipefail
+publish release	Publish	2026-10-29T11:35:31.3874838Z ^[[36;1mset -euo pipefail^[[0m
+publish release	Publish	2026-10-29T11:35:31.3875000Z ^[[36;1mrows="$(^[[0m
+publish release	Publish	2026-10-29T11:35:31.3875150Z ^[[36;1m  for z in dist/*.zip; do^[[0m
+publish release	Publish	2026-10-29T11:35:31.3875342Z ^[[36;1m    printf '| `%s` |\n' "$(basename "$z")"^[[0m
+publish release	Publish	2026-10-29T11:35:31.3875738Z ^[[36;1m  done^[[0m
+publish release	Publish	2026-10-29T11:35:31.3875872Z ^[[36;1m)"^[[0m
+publish release	Publish	2026-10-29T11:35:31.3876015Z ^[[36;1mnotes=$(printf '%s\n' \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3876192Z ^[[36;1m  "## 下载" \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3876335Z ^[[36;1m  "" \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3876616Z ^[[36;1m  "插件开发 CLI（不需要 tdjson）：解压后跑 \`fuyubot-sdk --version\`。" \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3876851Z ^[[36;1m  "" \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3876988Z ^[[36;1m  "| 资产 |" \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3877210Z ^[[36;1m  "| --- |" \^[[0m
+publish release	Publish	2026-10-29T11:35:31.3877493Z ^[[36;1m  "$rows")^[[0m
+publish release	Publish	2026-10-29T11:35:31.3877672Z ^[[36;1mif gh release view "$TAG" >/dev/null 2>&1; then^[[0m
+publish release	Publish	2026-10-29T11:35:31.3878019Z ^[[36;1m  gh release upload "$TAG" dist/*.zip --clobber^[[0m
+publish release	Publish	2026-10-29T11:35:31.3878361Z ^[[36;1m  gh release edit "$TAG" --notes "$notes"^[[0m
+publish release	Publish	2026-10-29T11:35:31.3878540Z ^[[36;1melse^[[0m
+publish release	Publish	2026-10-29T11:35:31.3878856Z ^[[36;1m  gh release create "$TAG" dist/*.zip --title "fuyubot-sdk $TAG" --notes "$notes"^[[0m
+publish release	Publish	2026-10-29T11:35:31.3879223Z ^[[36;1mfi^[[0m
+publish release	Publish	2026-10-29T11:35:31.3905718Z shell: /usr/bin/bash -e {0}
+publish release	Publish	2026-10-29T11:35:31.3905889Z env:
+publish release	Publish	2026-10-29T11:35:31.3906025Z   CARGO_TERM_COLOR: always
+publish release	Publish	2026-10-29T11:35:31.3907688Z   GH_TOKEN: ***
+publish release	Publish	2026-10-29T11:35:31.3907876Z   TAG: v0.1.2
+publish release	Publish	2026-10-29T11:35:31.3908015Z ##[endgroup]
+publish release	Publish	2026-10-29T11:35:31.5887314Z failed to run git: fatal: not a git repository (or any of the parent directories): .git
+publish release	Publish	2026-10-29T11:35:31.5887658Z 
+publish release	Publish	2026-10-29T11:35:31.5922025Z ##[error]Process completed with exit code 1.

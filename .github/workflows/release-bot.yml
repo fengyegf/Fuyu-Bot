@@ -244,9 +244,9 @@ jobs:
             "$table" \
             "" \
             "插件开发 CLI（\`fuyubot-sdk\`）在 FuyuBot-SDK 仓库的 Release 里单独发布（不需要 tdjson）。")
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip --clobber
-            gh release edit "$TAG" --notes "$notes"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" dist/*.zip --title "fuyubot $TAG" --notes "$notes"
+            gh release create "$TAG" dist/*.zip --title "fuyubot $TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
           fi
