@@ -31,6 +31,14 @@ STAGE="${DIST}/${PKG}"
 PLUGIN_DIR="target/${TRIPLE}/release"
 
 [[ -f "$BIN" ]] || { echo "error: 找不到 $BIN（先 cargo build --release --target $TRIPLE）" >&2; exit 1; }
+
+# 参数错位是最容易犯的错：把包名（第 7 个）写到了第 6 个位置，报错会变成
+# 「fuyubot-…-android-aarch64 里没有 libtdjson.so」，看得人一头雾水。先点明。
+if [[ ! -d "$TDLIB_DIR" ]]; then
+  echo "error: 第 6 个参数应是**含 libtdjson.so 的目录**，实际传的是 '$TDLIB_DIR'（不是目录）" >&2
+  echo "       用法：$0 <triple> <arch> <tdlib版本> <tdlib commit> <dist> [tdjson目录] [包名]" >&2
+  exit 1
+fi
 [[ -f "$TDLIB_DIR/libtdjson.so" ]] || { echo "error: $TDLIB_DIR 里没有 libtdjson.so" >&2; ls -la "$TDLIB_DIR" >&2 || true; exit 1; }
 
 rm -rf "$STAGE"
